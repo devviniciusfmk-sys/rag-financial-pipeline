@@ -1,0 +1,591 @@
+"""Leitura, limpeza e chunking dos datasets baixados por `ingestion.downloader`.
+
+Saida canonica: uma lista de `Chunk` (cnpj, text, metadata), pronta para virar
+embedding. O texto segue sempre o mesmo template:
+
+    "Empresa: {razao_social}. CNPJ: {cnpj}. Situacao: {situacao}.
+     CNAE: {cnae}. Porte: {porte}. UF: {uf}. Capital: R$ {capital}"
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import unicodedata
+import zipfile
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Iterable, Iterator
+
+import pandas as pd
+
+from config import PROCESSED_DIR, RAW_DIR, settings, setup_logging
+
+logger = setup_logging()
+
+ENCODING = "latin-1"
+SEPARATOR = ";"
+NOT_INFORMED = "NAO INFORMADO"
+
+NULL_TOKENS = {
+    "",
+    "-",
+    "--",
+    "n/a",
+    "na",
+    "nan",
+    "none",
+    "null",
+    "nao informado",
+    "não informado",
+    "nao informada",
+    "não informada",
+    "0",
+    "00000000",
+    "*",
+}
+
+# Layout oficial do arquivo EMPRESAS da Receita Federal (sem cabecalho)
+RFB_EMPRESAS_COLUMNS = [
+    "cnpj_basico",
+    "razao_social",
+    "natureza_juridica",
+    "qualificacao_responsavel",
+    "capital_social",
+    "porte",
+    "ente_federativo_responsavel",
+]
+
+# Layout do arquivo ESTABELECIMENTOS (usado apenas se estiver presente em data/raw)
+RFB_ESTAB_COLUMNS = [
+    "cnpj_basico",
+    "cnpj_ordem",
+    "cnpj_dv",
+    "identificador_matriz_filial",
+    "nome_fantasia",
+    "situacao_cadastral",
+    "data_situacao_cadastral",
+    "motivo_situacao_cadastral",
+    "nome_cidade_exterior",
+    "pais",
+    "data_inicio_atividade",
+    "cnae_fiscal_principal",
+    "cnae_fiscal_secundaria",
+    "tipo_logradouro",
+    "logradouro",
+    "numero",
+    "complemento",
+    "bairro",
+    "cep",
+    "uf",
+    "municipio",
+    "ddd_1",
+    "telefone_1",
+    "ddd_2",
+    "telefone_2",
+    "ddd_fax",
+    "fax",
+    "correio_eletronico",
+    "situacao_especial",
+    "data_situacao_especial",
+]
+
+PORTE_MAP = {
+    "00": "Nao informado",
+    "01": "Microempresa (ME)",
+    "03": "Empresa de Pequeno Porte (EPP)",
+    "05": "Demais (medio/grande porte)",
+}
+
+SITUACAO_MAP = {
+    "01": "Nula",
+    "02": "Ativa",
+    "03": "Suspensa",
+    "04": "Inapta",
+    "08": "Baixada",
+}
+
+CVM_SITUACAO_MAP = {
+    "ATIVO": "Ativa",
+    "CANCELADA": "Cancelada",
+    "EM ANALISE": "Em analise",
+}
+
+
+@dataclass
+class Chunk:
+    """Unidade de texto que sera vetorizada."""
+
+    cnpj: str
+    text: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+# --------------------------------------------------------------------------- #
+# Normalizacao de campos
+# --------------------------------------------------------------------------- #
+def clean_text(value: Any, default: str = NOT_INFORMED, title_case: bool = False) -> str:
+    """Remove nulos, caracteres de controle e espacos redundantes."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return default
+    text = str(value)
+    if text.lower().strip() in {"nan", "nat", "none"}:
+        return default
+
+    # Normaliza compatibilidade unicode e descarta categorias de controle
+    text = unicodedata.normalize("NFKC", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch)[0] != "C")
+    # Caracteres tipograficos que a latin-1 costuma trazer sujos
+    text = text.replace("�", " ").replace("\x00", " ")
+    text = re.sub(r"[\"'`^~]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" .,;-")
+
+    if text.lower() in NULL_TOKENS:
+        return default
+    if title_case and text.isupper():
+        text = text.title()
+    return text or default
+
+
+def normalize_cnpj(value: Any, pad_to_matriz: bool = True) -> str:
+    """Retorna somente digitos. CNPJ basico (8) vira matriz 0001 + DV calculado."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    digits = re.sub(r"\D", "", str(value))
+    if not digits:
+        return ""
+    if len(digits) >= 14:
+        return digits[:14]
+    if len(digits) == 12:
+        return digits + _cnpj_check_digits(digits)
+    if len(digits) <= 8 and pad_to_matriz:
+        base = digits.zfill(8)
+        partial = base + "0001"
+        return partial + _cnpj_check_digits(partial)
+    return digits.zfill(14)
+
+
+def _cnpj_check_digits(first_twelve: str) -> str:
+    """Calcula os dois digitos verificadores de um CNPJ (modulo 11)."""
+    def dv(numbers: str, weights: list[int]) -> str:
+        total = sum(int(n) * w for n, w in zip(numbers, weights))
+        rest = total % 11
+        return "0" if rest < 2 else str(11 - rest)
+
+    w1 = [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+    w2 = [6] + w1
+    d1 = dv(first_twelve, w1)
+    d2 = dv(first_twelve + d1, w2)
+    return d1 + d2
+
+
+def format_cnpj(cnpj: str) -> str:
+    """00000000000191 -> 00.000.000/0001-91"""
+    d = re.sub(r"\D", "", cnpj or "").zfill(14)[:14]
+    return f"{d[:2]}.{d[2:5]}.{d[5:8]}/{d[8:12]}-{d[12:]}"
+
+
+def parse_capital(value: Any) -> float:
+    """Converte '1000000,00' / '1.000.000,00' / 1000000.0 em float."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    raw = str(value).strip()
+    if not raw:
+        return 0.0
+    raw = re.sub(r"[^\d,.\-]", "", raw)
+    if "," in raw:  # formato brasileiro
+        raw = raw.replace(".", "").replace(",", ".")
+    try:
+        return float(raw)
+    except ValueError:
+        return 0.0
+
+
+def format_capital(value: float) -> str:
+    """1000000.0 -> '1.000.000,00'"""
+    formatted = f"{value:,.2f}"
+    return formatted.replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+def map_porte(code: Any) -> str:
+    raw = clean_text(code, default="")
+    key = re.sub(r"\D", "", raw).zfill(2)[:2]
+    return PORTE_MAP.get(key, raw or NOT_INFORMED)
+
+
+def map_situacao(code: Any) -> str:
+    raw = clean_text(code, default="")
+    key = re.sub(r"\D", "", raw).zfill(2)[:2]
+    if key in SITUACAO_MAP:
+        return SITUACAO_MAP[key]
+    upper = raw.upper()
+    return CVM_SITUACAO_MAP.get(upper, raw or NOT_INFORMED)
+
+
+def build_chunk_text(
+    razao_social: str,
+    cnpj: str,
+    situacao: str,
+    cnae: str,
+    porte: str,
+    uf: str,
+    capital: float,
+) -> str:
+    """Template unico de texto para embedding."""
+    return (
+        f"Empresa: {razao_social}. "
+        f"CNPJ: {cnpj}. "
+        f"Situacao: {situacao}. "
+        f"CNAE: {cnae}. "
+        f"Porte: {porte}. "
+        f"UF: {uf}. "
+        f"Capital: R$ {format_capital(capital)}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Leitura dos arquivos brutos
+# --------------------------------------------------------------------------- #
+def _series(df: pd.DataFrame, column: str, default: Any = "") -> pd.Series:
+    """Devolve a coluna pedida ou uma Series constante do mesmo tamanho."""
+    if column in df.columns:
+        return df[column]
+    return pd.Series([default] * len(df), index=df.index, dtype=object)
+
+
+def _read_csv(
+    handle: Any,
+    columns: list[str] | None = None,
+    limit: int | None = None,
+    header: int | None = None,
+) -> pd.DataFrame:
+    """read_csv com os defaults dos dados abertos brasileiros."""
+    df = pd.read_csv(
+        handle,
+        sep=SEPARATOR,
+        encoding=ENCODING,
+        header=header,
+        names=columns,
+        dtype=str,
+        nrows=limit,
+        quotechar='"',
+        keep_default_na=False,
+        na_values=["", "NA", "NULL"],
+        on_bad_lines="skip",
+        engine="python",
+    )
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    return df
+
+
+def _open_rfb_member(zip_path: Path, marker: str) -> tuple[str, Any] | None:
+    """Localiza dentro do zip o membro cujo nome contem `marker` (ex.: EMPRE)."""
+    zf = zipfile.ZipFile(zip_path)
+    for name in zf.namelist():
+        if marker.upper() in name.upper():
+            return name, zf.open(name)
+    zf.close()
+    return None
+
+
+def load_receita_federal(
+    path: Path | None = None, limit: int | None = None
+) -> pd.DataFrame:
+    """Le Empresas0.zip (ou o CSV ja extraido) e retorna o DataFrame limpo."""
+    zip_path = path or (RAW_DIR / "Empresas0.zip")
+    limit = limit or settings.demo_row_limit
+
+    if not zip_path.exists():
+        logger.warning("receita federal: arquivo ausente em %s", zip_path)
+        return pd.DataFrame(columns=RFB_EMPRESAS_COLUMNS)
+
+    if zip_path.suffix.lower() == ".zip":
+        member = _open_rfb_member(zip_path, "EMPRE")
+        if member is None:
+            logger.warning("receita federal: nenhum membro EMPRECSV em %s", zip_path)
+            return pd.DataFrame(columns=RFB_EMPRESAS_COLUMNS)
+        name, handle = member
+        logger.info("lendo %s::%s (limite=%s)", zip_path.name, name, limit)
+        with handle:
+            df = _read_csv(handle, columns=RFB_EMPRESAS_COLUMNS, limit=limit)
+    else:
+        df = _read_csv(zip_path, columns=RFB_EMPRESAS_COLUMNS, limit=limit)
+
+    df = df.dropna(subset=["razao_social"])
+    df["cnpj"] = df["cnpj_basico"].map(normalize_cnpj)
+    df["razao_social"] = df["razao_social"].map(lambda v: clean_text(v, title_case=True))
+    df["capital_social_num"] = df["capital_social"].map(parse_capital)
+    df["porte_desc"] = df["porte"].map(map_porte)
+    df["porte_cod"] = df["porte"].map(
+        lambda v: re.sub(r"\D", "", clean_text(v, default="")).zfill(2)[:2]
+    )
+    df = df[df["cnpj"] != ""]
+
+    estab = _load_rfb_estabelecimentos(limit=limit)
+    if estab is not None and not estab.empty:
+        df = df.merge(estab, on="cnpj_basico", how="left")
+        logger.info("receita federal: enriquecido com estabelecimentos")
+
+    for col, default in (
+        ("uf", NOT_INFORMED),
+        ("cnae_fiscal_principal", NOT_INFORMED),
+        ("situacao_cadastral", NOT_INFORMED),
+    ):
+        if col not in df.columns:
+            df[col] = default
+        df[col] = df[col].fillna(default)
+
+    df["situacao_desc"] = df["situacao_cadastral"].map(map_situacao)
+    df["source"] = "receita_federal"
+    logger.info("receita federal: %d registros limpos", len(df))
+    return df
+
+
+def _load_rfb_estabelecimentos(limit: int | None = None) -> pd.DataFrame | None:
+    """Opcional: usa Estabelecimentos0.zip se o usuario tiver baixado."""
+    candidates = list(RAW_DIR.glob("Estabelecimentos*.zip")) + list(
+        RAW_DIR.glob("*ESTABELE*")
+    )
+    if not candidates:
+        return None
+
+    target = candidates[0]
+    try:
+        if target.suffix.lower() == ".zip":
+            member = _open_rfb_member(target, "ESTABELE")
+            if member is None:
+                return None
+            _, handle = member
+            with handle:
+                df = _read_csv(handle, columns=RFB_ESTAB_COLUMNS, limit=limit)
+        else:
+            df = _read_csv(target, columns=RFB_ESTAB_COLUMNS, limit=limit)
+    except (zipfile.BadZipFile, OSError, ValueError) as exc:
+        logger.warning("estabelecimentos ignorado (%s): %s", target.name, exc)
+        return None
+
+    df = df[df["identificador_matriz_filial"].astype(str).str.strip() == "1"]
+    keep = ["cnpj_basico", "uf", "cnae_fiscal_principal", "situacao_cadastral"]
+    df = df[keep].drop_duplicates(subset=["cnpj_basico"])
+    df["uf"] = df["uf"].map(lambda v: clean_text(v).upper())
+    return df
+
+
+def load_cvm(path: Path | None = None, limit: int | None = None) -> pd.DataFrame:
+    """Le cad_cia_aberta.csv (companhias abertas registradas na CVM)."""
+    csv_path = path or (RAW_DIR / "cad_cia_aberta.csv")
+    if not csv_path.exists():
+        logger.warning("cvm: arquivo ausente em %s", csv_path)
+        return pd.DataFrame()
+
+    df = _read_csv(csv_path, limit=limit, header=0)
+    rename = {
+        "cnpj_cia": "cnpj_raw",
+        "denom_social": "razao_social",
+        "denom_comerc": "nome_fantasia",
+        "sit": "situacao_cadastral",
+        "setor_ativ": "setor_atividade",
+        "uf": "uf",
+        "cd_cvm": "codigo_cvm",
+        "categ_reg": "categoria_registro",
+        "tp_merc": "tipo_mercado",
+        "mun": "municipio",
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+
+    if "razao_social" not in df.columns:
+        logger.warning("cvm: layout inesperado, colunas=%s", list(df.columns)[:10])
+        return pd.DataFrame()
+
+    df["cnpj"] = _series(df, "cnpj_raw").map(lambda v: normalize_cnpj(v, pad_to_matriz=False))
+    df["razao_social"] = df["razao_social"].map(lambda v: clean_text(v, title_case=True))
+    df["uf"] = _series(df, "uf", NOT_INFORMED).map(lambda v: clean_text(v).upper())
+    df["situacao_desc"] = _series(df, "situacao_cadastral").map(map_situacao)
+    df["setor_atividade"] = _series(df, "setor_atividade", NOT_INFORMED).map(clean_text)
+    df["capital_social_num"] = 0.0
+    df["porte_desc"] = "Companhia aberta"
+    df["porte_cod"] = "05"
+    df["source"] = "cvm"
+    df = df[(df["cnpj"] != "") & (df["razao_social"] != NOT_INFORMED)]
+    df = df.drop_duplicates(subset=["cnpj"])
+    logger.info("cvm: %d registros limpos", len(df))
+    return df
+
+
+def load_bacen(path: Path | None = None) -> pd.DataFrame:
+    """Le o diretorio de participantes do Open Finance (JSON)."""
+    json_path = path or (RAW_DIR / "open_finance_participants.json")
+    if not json_path.exists():
+        logger.warning("bacen: arquivo ausente em %s", json_path)
+        return pd.DataFrame()
+
+    with json_path.open("r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    if isinstance(payload, dict):
+        payload = payload.get("data") or payload.get("participants") or []
+    if not isinstance(payload, list):
+        logger.warning("bacen: payload inesperado (%s)", type(payload).__name__)
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        cnpj = normalize_cnpj(item.get("RegistrationNumber"), pad_to_matriz=False)
+        name = clean_text(
+            item.get("OrganisationName")
+            or item.get("LegalEntityName")
+            or item.get("RegisteredName"),
+            title_case=True,
+        )
+        if not cnpj or name == NOT_INFORMED:
+            continue
+        servers = item.get("AuthorisationServers") or []
+        rows.append(
+            {
+                "cnpj": cnpj,
+                "razao_social": name,
+                "situacao_desc": clean_text(item.get("Status"), default="Ativa"),
+                "uf": clean_text(item.get("City"), default=NOT_INFORMED).upper()[:40],
+                "setor_atividade": "Instituicao participante do Open Finance Brasil",
+                "capital_social_num": 0.0,
+                "porte_desc": clean_text(item.get("Size"), default="Instituicao financeira"),
+                "porte_cod": "05",
+                "organisation_id": clean_text(item.get("OrganisationId"), default=""),
+                "authorisation_servers": len(servers) if isinstance(servers, list) else 0,
+                "source": "bacen",
+            }
+        )
+
+    df = pd.DataFrame(rows).drop_duplicates(subset=["cnpj"])
+    logger.info("bacen: %d participantes limpos", len(df))
+    return df
+
+
+# --------------------------------------------------------------------------- #
+# Chunking
+# --------------------------------------------------------------------------- #
+def _row_to_chunk(row: dict[str, Any]) -> Chunk | None:
+    cnpj = str(row.get("cnpj") or "")
+    razao_social = clean_text(row.get("razao_social"))
+    if not cnpj or razao_social == NOT_INFORMED:
+        return None
+
+    situacao = clean_text(row.get("situacao_desc"))
+    cnae = clean_text(
+        row.get("cnae_fiscal_principal") or row.get("setor_atividade")
+    )
+    porte = clean_text(row.get("porte_desc"))
+    uf = clean_text(row.get("uf")).upper()
+    capital = float(row.get("capital_social_num") or 0.0)
+    source = str(row.get("source") or "desconhecida")
+
+    text = build_chunk_text(razao_social, cnpj, situacao, cnae, porte, uf, capital)
+    metadata = {
+        "razao_social": razao_social,
+        "cnpj_formatado": format_cnpj(cnpj),
+        "situacao": situacao,
+        "cnae": cnae,
+        "porte": porte,
+        "porte_cod": str(row.get("porte_cod") or ""),
+        "uf": uf,
+        "capital_social": capital,
+        "source": source,
+    }
+    for optional in ("nome_fantasia", "municipio", "codigo_cvm", "organisation_id"):
+        value = row.get(optional)
+        if value not in (None, "", NOT_INFORMED) and not pd.isna(value):
+            metadata[optional] = clean_text(value)
+    return Chunk(cnpj=cnpj, text=text, metadata=metadata)
+
+
+def dataframe_to_chunks(df: pd.DataFrame) -> list[Chunk]:
+    """Converte um DataFrame ja normalizado em chunks de texto."""
+    if df is None or df.empty:
+        return []
+    chunks: list[Chunk] = []
+    for row in df.to_dict(orient="records"):
+        chunk = _row_to_chunk(row)
+        if chunk is not None:
+            chunks.append(chunk)
+    return chunks
+
+
+def dedupe_chunks(chunks: Iterable[Chunk]) -> list[Chunk]:
+    """Remove chunks com mesmo (cnpj, texto), preservando a ordem."""
+    seen: set[tuple[str, str]] = set()
+    unique: list[Chunk] = []
+    for chunk in chunks:
+        key = (chunk.cnpj, chunk.text)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(chunk)
+    return unique
+
+
+def build_all_chunks(limit: int | None = None) -> list[Chunk]:
+    """Le todas as fontes disponiveis em data/raw e devolve os chunks."""
+    chunks: list[Chunk] = []
+    for name, loader in (
+        ("receita_federal", lambda: load_receita_federal(limit=limit)),
+        ("cvm", lambda: load_cvm(limit=limit)),
+        ("bacen", load_bacen),
+    ):
+        try:
+            df = loader()
+        except (OSError, ValueError, KeyError) as exc:
+            logger.error("falha ao processar %s: %s", name, exc)
+            continue
+        produced = dataframe_to_chunks(df)
+        logger.info("%s: %d chunks", name, len(produced))
+        chunks.extend(produced)
+
+    unique = dedupe_chunks(chunks)
+    logger.info("total: %d chunks (%d duplicados removidos)", len(unique), len(chunks) - len(unique))
+    return unique
+
+
+def save_chunks(chunks: list[Chunk], path: Path | None = None) -> Path:
+    """Persiste os chunks em JSONL dentro de data/processed."""
+    out = path or (PROCESSED_DIR / "chunks.jsonl")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", encoding="utf-8") as fh:
+        for chunk in chunks:
+            fh.write(json.dumps(chunk.to_dict(), ensure_ascii=False) + "\n")
+    logger.info("chunks salvos em %s (%d linhas)", out, len(chunks))
+    return out
+
+
+def load_chunks(path: Path | None = None) -> Iterator[Chunk]:
+    """Le de volta o JSONL gerado por `save_chunks`."""
+    src = path or (PROCESSED_DIR / "chunks.jsonl")
+    if not src.exists():
+        return
+    with src.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            yield Chunk(
+                cnpj=data["cnpj"], text=data["text"], metadata=data.get("metadata", {})
+            )
+
+
+if __name__ == "__main__":  # pragma: no cover
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Limpa os dados e gera os chunks")
+    parser.add_argument("--limit", type=int, default=None, help="max de linhas por fonte")
+    args = parser.parse_args()
+
+    produced = build_all_chunks(limit=args.limit)
+    save_chunks(produced)
+    for sample in produced[:3]:
+        logger.info("exemplo: %s", sample.text)

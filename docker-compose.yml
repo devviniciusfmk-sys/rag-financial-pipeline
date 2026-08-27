@@ -1,0 +1,77 @@
+services:
+  postgres:
+    # Imagem oficial pgvector construida sobre postgres:16-bookworm
+    image: pgvector/pgvector:pg16
+    container_name: rag_financial_pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+      # Locale pt-BR ajuda em ORDER BY sobre razao_social acentuada
+      LANG: pt_BR.utf8
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      # 54322 no host para bater com o DATABASE_URL do .env.example
+      - "54322:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Scripts em docker-entrypoint-initdb.d rodam apenas na primeira subida
+      - ./docker/init-pgvector.sql:/docker-entrypoint-initdb.d/00-init-pgvector.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres && psql -U postgres -d postgres -tAc \"SELECT 1 FROM pg_extension WHERE extname='vector'\" | grep -q 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    shm_size: 512mb
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "maintenance_work_mem=512MB"
+      - "-c"
+      - "max_parallel_maintenance_workers=4"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag_financial_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      LLM_MODEL: ${LLM_MODEL:-nvidia/nemotron-3-ultra:free}
+      FALLBACK_MODEL: ${FALLBACK_MODEL:-meta-llama/llama-3.3-70b:free}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      DEBUG: ${DEBUG:-true}
+      HF_HOME: /app/.cache/huggingface
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - hfcache:/app/.cache/huggingface
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=5).status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    profiles:
+      # `docker compose up` sobe so o banco; `--profile app up` sobe a API tambem
+      - app
+
+volumes:
+  pgdata:
+    driver: local
+  hfcache:
+    driver: local
