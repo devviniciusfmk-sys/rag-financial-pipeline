@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import zipfile
 from dataclasses import dataclass, field
@@ -42,6 +43,15 @@ READ_TIMEOUT = 120
 
 RETRYABLE = (ReqConnectionError, Timeout, ChunkedEncodingError, HTTPError, OSError)
 
+# A Receita nao serve mais os zips por caminho HTTP direto: o dado aberto do
+# CNPJ vive num share publico Nextcloud (SERPRO), acessivel por WebDAV usando
+# o token do share como usuario do basic auth e senha vazia.
+RFB_WEBDAV = "https://arquivos.receitafederal.gov.br/public.php/webdav"
+RFB_SHARE_TOKEN = "YggdBLfdninEJX9"
+RFB_FALLBACK_FOLDER = "2026-08"  # usado se a listagem do share falhar
+_FOLDER_RE = re.compile(r"(\d{4}-\d{2})")
+_rfb_folder_cache: str | None = None
+
 
 @dataclass(frozen=True)
 class Source:
@@ -53,6 +63,9 @@ class Source:
     kind: str  # "zip" | "csv" | "json"
     description: str = ""
     headers: dict[str, str] = field(default_factory=dict)
+    auth: tuple[str, str] | None = None
+    # Quando True, a URL e montada com a pasta mensal mais recente do share.
+    rfb_share: bool = False
 
     @property
     def path(self) -> Path:
@@ -62,16 +75,20 @@ class Source:
 SOURCES: dict[str, Source] = {
     "receita_federal": Source(
         key="receita_federal",
-        url="https://dadosabertos.rfb.gov.br/CNPJ/Empresas0.zip",
+        url="",  # resolvida em runtime: <share>/<AAAA-MM>/Empresas0.zip
         filename="Empresas0.zip",
         kind="zip",
         description="Receita Federal - cadastro de empresas (fatia 0, modo demo)",
+        auth=(RFB_SHARE_TOKEN, ""),
+        rfb_share=True,
     ),
     "receita_federal_estabelecimentos": Source(
         key="receita_federal_estabelecimentos",
-        url="https://dadosabertos.rfb.gov.br/CNPJ/Estabelecimentos0.zip",
+        url="",  # resolvida em runtime: <share>/<AAAA-MM>/Estabelecimentos0.zip
         filename="Estabelecimentos0.zip",
         kind="zip",
+        auth=(RFB_SHARE_TOKEN, ""),
+        rfb_share=True,
         description=(
             "Receita Federal - estabelecimentos (fatia 0): traz UF, CNAE e "
             "situacao cadastral, ausentes no arquivo de empresas"
@@ -99,12 +116,61 @@ class DownloadError(RuntimeError):
     """Falha definitiva no download de uma fonte."""
 
 
-def _session(extra_headers: dict[str, str] | None = None) -> requests.Session:
+def _session(
+    extra_headers: dict[str, str] | None = None,
+    auth: tuple[str, str] | None = None,
+) -> requests.Session:
     sess = requests.Session()
     sess.headers.update({"User-Agent": USER_AGENT, "Accept-Encoding": "gzip, deflate"})
     if extra_headers:
         sess.headers.update(extra_headers)
+    if auth:
+        sess.auth = auth
     return sess
+
+
+def parse_rfb_folders(webdav_xml: str) -> list[str]:
+    """Extrai as pastas AAAA-MM de uma resposta PROPFIND do share da RFB."""
+    return sorted({m.group(1) for m in _FOLDER_RE.finditer(webdav_xml)})
+
+
+def latest_rfb_folder() -> str:
+    """Descobre a competencia mais recente publicada no share da Receita.
+
+    Evita que a URL apodreca a cada mes. Se a listagem falhar, cai no valor
+    fixo de `RFB_FALLBACK_FOLDER`.
+    """
+    global _rfb_folder_cache
+    if _rfb_folder_cache:
+        return _rfb_folder_cache
+
+    try:
+        with _session(auth=(RFB_SHARE_TOKEN, "")) as sess:
+            resp = sess.request(
+                "PROPFIND",
+                f"{RFB_WEBDAV}/",
+                headers={"Depth": "1"},
+                timeout=(CONNECT_TIMEOUT, 60),
+            )
+            resp.raise_for_status()
+        folders = parse_rfb_folders(resp.text)
+        if folders:
+            _rfb_folder_cache = folders[-1]
+            logger.info("receita federal: competencia mais recente = %s", _rfb_folder_cache)
+            return _rfb_folder_cache
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning("nao foi possivel listar o share da RFB (%s)", exc)
+
+    _rfb_folder_cache = RFB_FALLBACK_FOLDER
+    logger.warning("usando competencia fixa %s", _rfb_folder_cache)
+    return _rfb_folder_cache
+
+
+def resolve_url(source: Source) -> str:
+    """URL final da fonte (as da RFB dependem da competencia publicada)."""
+    if source.rfb_share:
+        return f"{RFB_WEBDAV}/{latest_rfb_folder()}/{source.filename}"
+    return source.url
 
 
 def _is_valid(source: Source, path: Path) -> bool:
@@ -132,15 +198,16 @@ def _is_valid(source: Source, path: Path) -> bool:
     before_sleep=before_sleep_log(logger, logging.WARNING),
 )
 def _download_stream(source: Source, destination: Path) -> Path:
-    """Baixa `source.url` para `destination` com barra de progresso."""
+    """Baixa a fonte para `destination` com barra de progresso."""
     tmp = destination.with_suffix(destination.suffix + ".part")
     tmp.unlink(missing_ok=True)
 
+    url = resolve_url(source)
     written = 0
     total = 0
-    with _session(source.headers) as sess:
+    with _session(source.headers, auth=source.auth) as sess:
         with sess.get(
-            source.url,
+            url,
             stream=True,
             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
             allow_redirects=True,
@@ -168,7 +235,7 @@ def _download_stream(source: Source, destination: Path) -> Path:
 
     if written == 0:
         tmp.unlink(missing_ok=True)
-        raise DownloadError(f"{source.key}: resposta vazia de {source.url}")
+        raise DownloadError(f"{source.key}: resposta vazia de {url}")
 
     if total and written != total:
         tmp.unlink(missing_ok=True)
@@ -190,12 +257,12 @@ def download_source(source: Source, force: bool = False) -> Path:
         logger.info("skip %s: ja existe (%.1f MB) em %s", source.key, size_mb, dest)
         return dest
 
-    logger.info("baixando %s -> %s", source.url, dest)
+    logger.info("baixando %s -> %s", resolve_url(source), dest)
     try:
         path = _download_stream(source, dest)
     except Exception as exc:  # noqa: BLE001 - convertido em erro de dominio
         raise DownloadError(
-            f"falha ao baixar {source.key} ({source.url}): {exc}"
+            f"falha ao baixar {source.key} ({resolve_url(source)}): {exc}"
         ) from exc
 
     if not _is_valid(source, path):

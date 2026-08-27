@@ -7,7 +7,7 @@
 ![LangChain](https://img.shields.io/badge/LangChain-0.2-1C3C3C?style=flat-square&logo=langchain&logoColor=white)
 ![pgvector](https://img.shields.io/badge/pgvector-PostgreSQL-4169E1?style=flat-square&logo=postgresql&logoColor=white)
 ![OpenRouter](https://img.shields.io/badge/OpenRouter-multi--model-000000?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-82%20passing-1D9E75?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-94%20passing-1D9E75?style=flat-square)
 ![Docker](https://img.shields.io/badge/Docker-ready-2496ED?style=flat-square&logo=docker&logoColor=white)
 
 ## What it does
@@ -142,7 +142,7 @@ Response includes `model_used` and `fallback_used` fields for observability.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                          # 82 tests
+pytest                          # 94 tests
 pytest tests/test_cleaner.py -v
 ```
 
@@ -152,6 +152,7 @@ pytest tests/test_cleaner.py -v
 | `test_embeddings.py` | 11 | Shape (n,384), float32, normalized, batch processing |
 | `test_api.py` | 18 | All endpoints, CORS, 422/500/502/503 error handling |
 | `test_chain.py` | 14 | Fallback, no-context guard, invalid key, all-fail |
+| `test_downloader.py` | 12 | RFB share discovery, URL building, zip/JSON validation, zip-slip |
 
 No database, network or API key required to run tests.
 

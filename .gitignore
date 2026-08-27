@@ -9,3 +9,4 @@ data/processed/*
 !data/processed/.gitkeep
 .pytest_cache/
 *.egg-info/
+.cache/
