@@ -7,7 +7,7 @@
 ![LangChain](https://img.shields.io/badge/LangChain-0.2-1C3C3C?style=flat-square&logo=langchain&logoColor=white)
 ![pgvector](https://img.shields.io/badge/pgvector-PostgreSQL-4169E1?style=flat-square&logo=postgresql&logoColor=white)
 ![OpenRouter](https://img.shields.io/badge/OpenRouter-multi--model-000000?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-70%20passing-1D9E75?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-76%20passing-1D9E75?style=flat-square)
 ![Docker](https://img.shields.io/badge/Docker-ready-2496ED?style=flat-square&logo=docker&logoColor=white)
 
 ## What it does
@@ -85,7 +85,7 @@ docker compose ps    # wait for "healthy"
 python -m scripts.build_index --limit 20000
 
 # Full mode — all sources, millions of records
-python -m scripts.build_index --full
+python -m scripts.build_index --limit 0
 ```
 
 ## Run the API
@@ -133,13 +133,13 @@ Response includes `model_used` and `fallback_used` fields for observability.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                          # 70 tests, ~27s
+pytest                          # 76 tests, ~60s
 pytest tests/test_cleaner.py -v
 ```
 
 | File | Tests | Covers |
 |---|---|---|
-| `test_cleaner.py` | 27 | CNPJ check digit, capital parsing, chunking, round-trip |
+| `test_cleaner.py` | 33 | CNPJ check digit, capital parsing, chunking, round-trip |
 | `test_embeddings.py` | 11 | Shape (n,384), float32, normalized, batch processing |
 | `test_api.py` | 18 | All endpoints, CORS, 422/500/502/503 error handling |
 | `test_chain.py` | 14 | Fallback, no-context guard, invalid key, all-fail |
@@ -165,7 +165,7 @@ Indexes: `ivfflat (embedding vector_cosine_ops)`, GIN on `metadata`, unique on `
 
 **Why local embeddings?** `all-MiniLM-L6-v2` runs on CPU, costs $0, and produces 384-dim vectors sufficient for Portuguese company descriptions. No API dependency in the embedding layer.
 
-**Why pgvector over FAISS?** Persistent storage, SQL filters (`WHERE metadata->>'uf' = 'RS'`), and idempotent upserts. FAISS is kept as an in-memory fallback.
+**Why pgvector over FAISS?** Persistent storage, SQL filters and idempotent upserts.
 
 **Why OpenRouter?** Single API key, 100+ models, automatic failover between providers. The pipeline stays model-agnostic.
 

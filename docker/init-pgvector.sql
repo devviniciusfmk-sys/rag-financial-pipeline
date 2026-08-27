@@ -1,4 +1,9 @@
 -- Executado uma unica vez, na inicializacao do cluster.
+
+-- Banco de aplicacao do Metabase (metadados, dashboards, usuarios).
+-- Fica separado do banco `postgres`, onde vivem os embeddings.
+CREATE DATABASE metabase;
+
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS unaccent;

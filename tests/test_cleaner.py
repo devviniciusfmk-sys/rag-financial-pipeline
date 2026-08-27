@@ -207,3 +207,26 @@ def test_save_e_load_chunks_roundtrip(cleaner_with_raw, tmp_path) -> None:
 
 def test_load_chunks_arquivo_inexistente(tmp_path) -> None:
     assert list(load_chunks(tmp_path / "nao-existe.jsonl")) == []
+
+
+# --------------------------------------------------------------------------- #
+# Semantica do limite (--limit N / --limit 0 / --full)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("entrada", "esperado"),
+    [(None, None), (0, None), (-1, None), (1, 1), (20000, 20000)],
+)
+def test_resolve_limit(entrada, esperado) -> None:
+    from ingestion.cleaner import _resolve_limit
+
+    assert _resolve_limit(entrada) == esperado
+
+
+def test_limite_zero_le_tudo_e_limite_positivo_corta(cleaner_with_raw) -> None:
+    # limit=1 corta cada fonte tabular em 1 linha; bacen (JSON) nao usa limite
+    poucos = cleaner_with_raw.build_all_chunks(limit=1)
+    assert len(poucos) == 4
+
+    # limit=0 (equivalente a --full) le todos os registros
+    todos = cleaner_with_raw.build_all_chunks(limit=0)
+    assert len(todos) == 6

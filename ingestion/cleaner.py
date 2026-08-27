@@ -258,6 +258,17 @@ def _series(df: pd.DataFrame, column: str, default: Any = "") -> pd.Series:
     return pd.Series([default] * len(df), index=df.index, dtype=object)
 
 
+def _resolve_limit(limit: int | None) -> int | None:
+    """Normaliza o parametro `limit` das funcoes de leitura.
+
+    `None` ou qualquer valor <= 0 significam "sem teto" (le o arquivo inteiro);
+    valores positivos limitam o numero de linhas lidas por fonte.
+    """
+    if limit is None or limit <= 0:
+        return None
+    return limit
+
+
 def _read_csv(
     handle: Any,
     columns: list[str] | None = None,
@@ -296,9 +307,12 @@ def _open_rfb_member(zip_path: Path, marker: str) -> tuple[str, Any] | None:
 def load_receita_federal(
     path: Path | None = None, limit: int | None = None
 ) -> pd.DataFrame:
-    """Le Empresas0.zip (ou o CSV ja extraido) e retorna o DataFrame limpo."""
+    """Le Empresas0.zip (ou o CSV ja extraido) e retorna o DataFrame limpo.
+
+    `limit=None` ou `limit<=0` lem o arquivo inteiro.
+    """
     zip_path = path or (RAW_DIR / "Empresas0.zip")
-    limit = limit or settings.demo_row_limit
+    limit = _resolve_limit(limit)
 
     if not zip_path.exists():
         logger.warning("receita federal: arquivo ausente em %s", zip_path)
@@ -310,7 +324,7 @@ def load_receita_federal(
             logger.warning("receita federal: nenhum membro EMPRECSV em %s", zip_path)
             return pd.DataFrame(columns=RFB_EMPRESAS_COLUMNS)
         name, handle = member
-        logger.info("lendo %s::%s (limite=%s)", zip_path.name, name, limit)
+        logger.info("lendo %s::%s (limite=%s)", zip_path.name, name, limit or "sem teto")
         with handle:
             df = _read_csv(handle, columns=RFB_EMPRESAS_COLUMNS, limit=limit)
     else:
@@ -347,7 +361,10 @@ def load_receita_federal(
 
 
 def _load_rfb_estabelecimentos(limit: int | None = None) -> pd.DataFrame | None:
-    """Opcional: usa Estabelecimentos0.zip se o usuario tiver baixado."""
+    """Opcional: usa Estabelecimentos0.zip se o usuario tiver baixado.
+
+    Recebe o limite ja resolvido por `_resolve_limit` (None = sem teto).
+    """
     candidates = list(RAW_DIR.glob("Estabelecimentos*.zip")) + list(
         RAW_DIR.glob("*ESTABELE*")
     )
@@ -383,7 +400,7 @@ def load_cvm(path: Path | None = None, limit: int | None = None) -> pd.DataFrame
         logger.warning("cvm: arquivo ausente em %s", csv_path)
         return pd.DataFrame()
 
-    df = _read_csv(csv_path, limit=limit, header=0)
+    df = _read_csv(csv_path, limit=_resolve_limit(limit), header=0)
     rename = {
         "cnpj_cia": "cnpj_raw",
         "denom_social": "razao_social",
@@ -530,7 +547,10 @@ def dedupe_chunks(chunks: Iterable[Chunk]) -> list[Chunk]:
 
 
 def build_all_chunks(limit: int | None = None) -> list[Chunk]:
-    """Le todas as fontes disponiveis em data/raw e devolve os chunks."""
+    """Le todas as fontes disponiveis em data/raw e devolve os chunks.
+
+    `limit=None` ou `limit<=0` processam todos os registros de cada fonte.
+    """
     chunks: list[Chunk] = []
     for name, loader in (
         ("receita_federal", lambda: load_receita_federal(limit=limit)),
@@ -582,7 +602,12 @@ if __name__ == "__main__":  # pragma: no cover
     import argparse
 
     parser = argparse.ArgumentParser(description="Limpa os dados e gera os chunks")
-    parser.add_argument("--limit", type=int, default=None, help="max de linhas por fonte")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=settings.demo_row_limit,
+        help="max de linhas por fonte (0 = sem teto)",
+    )
     args = parser.parse_args()
 
     produced = build_all_chunks(limit=args.limit)

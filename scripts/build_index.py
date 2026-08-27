@@ -5,6 +5,7 @@ Uso:
     python -m scripts.build_index --limit 5000    # menos linhas da Receita
     python -m scripts.build_index --skip-download # reaproveita data/raw
     python -m scripts.build_index --reset         # limpa a tabela antes
+    python -m scripts.build_index --full          # indexa tudo, sem teto
 """
 
 from __future__ import annotations
@@ -51,20 +52,32 @@ def index_chunks(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Constroi o indice vetorial")
-    parser.add_argument("--limit", type=int, default=settings.demo_row_limit)
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=settings.demo_row_limit,
+        help="max de linhas por fonte (0 = sem teto)",
+    )
+    parser.add_argument(
+        "--full", action="store_true", help="Index all records without limit"
+    )
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--reset", action="store_true", help="trunca a tabela antes")
     parser.add_argument("--force-download", action="store_true")
     args = parser.parse_args()
 
     started = time.perf_counter()
+    limit = None if args.full else args.limit
+    logger.info(
+        "modo: %s", "completo (sem teto)" if not limit else f"demo ({limit} linhas/fonte)"
+    )
 
     if not args.skip_download:
         console.rule("[bold cyan]1/4 download")
         download_all(force=args.force_download)
 
     console.rule("[bold cyan]2/4 limpeza e chunking")
-    chunks = build_all_chunks(limit=args.limit)
+    chunks = build_all_chunks(limit=limit)
     if not chunks:
         logger.error("nenhum chunk gerado - verifique os arquivos em data/raw")
         return 1

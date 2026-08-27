@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     )
 
     database_url: str = Field(
-        default="postgresql://postgres:postgres@localhost:54322/postgres",
+        default="postgresql://postgres:postgres@localhost:5433/postgres",
         alias="DATABASE_URL",
     )
     openrouter_api_key: str = Field(default="", alias="OPENROUTER_API_KEY")
