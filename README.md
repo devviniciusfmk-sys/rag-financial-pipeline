@@ -7,7 +7,7 @@
 ![LangChain](https://img.shields.io/badge/LangChain-0.2-1C3C3C?style=flat-square&logo=langchain&logoColor=white)
 ![pgvector](https://img.shields.io/badge/pgvector-PostgreSQL-4169E1?style=flat-square&logo=postgresql&logoColor=white)
 ![OpenRouter](https://img.shields.io/badge/OpenRouter-multi--model-000000?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-76%20passing-1D9E75?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-82%20passing-1D9E75?style=flat-square)
 ![Docker](https://img.shields.io/badge/Docker-ready-2496ED?style=flat-square&logo=docker&logoColor=white)
 
 ## What it does
@@ -54,11 +54,20 @@ POST /ask → "Which banks participate in Open Finance?"
               (FastAPI · CORS · X-Process-Time · lifespan warm-up)
 ```
 
+## Dashboard
+
+> Live analytics powered by Metabase over the indexed data.
+
+Run `docker compose up -d` and open `http://localhost:3001`. Connect Metabase to
+`Host: postgres / Port: 5432 / Database: postgres` and paste the queries from
+[`docs/dashboard-queries.sql`](docs/dashboard-queries.sql).
+
 ## Data Sources
 
 | Source | What it contains | Volume |
 |---|---|---|
-| Receita Federal | 50M+ CNPJs, company size, CNAE, status | ~10GB full |
+| Receita Federal — Empresas | 50M+ CNPJs, company name, size, share capital | ~10GB full |
+| Receita Federal — Estabelecimentos | State (UF), CNAE and registration status | ~15GB full |
 | CVM | Listed companies, balance sheets, income statements | ~2GB |
 | Bacen Open Finance | Banks and fintechs in the Open Finance ecosystem | ~5MB |
 
@@ -81,7 +90,7 @@ docker compose ps    # wait for "healthy"
 ## Build the index
 
 ```bash
-# Demo mode — downloads first file only (~500MB), indexes 20k companies
+# Demo mode — downloads slice 0 of each source (~1.5GB), indexes 20k companies
 python -m scripts.build_index --limit 20000
 
 # Full mode — all sources, millions of records
@@ -133,13 +142,13 @@ Response includes `model_used` and `fallback_used` fields for observability.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                          # 76 tests, ~60s
+pytest                          # 82 tests
 pytest tests/test_cleaner.py -v
 ```
 
 | File | Tests | Covers |
 |---|---|---|
-| `test_cleaner.py` | 33 | CNPJ check digit, capital parsing, chunking, round-trip |
+| `test_cleaner.py` | 39 | CNPJ check digit, capital parsing, chunking, Estabelecimentos join, round-trip |
 | `test_embeddings.py` | 11 | Shape (n,384), float32, normalized, batch processing |
 | `test_api.py` | 18 | All endpoints, CORS, 422/500/502/503 error handling |
 | `test_chain.py` | 14 | Fallback, no-context guard, invalid key, all-fail |

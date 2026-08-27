@@ -67,6 +67,16 @@ SOURCES: dict[str, Source] = {
         kind="zip",
         description="Receita Federal - cadastro de empresas (fatia 0, modo demo)",
     ),
+    "receita_federal_estabelecimentos": Source(
+        key="receita_federal_estabelecimentos",
+        url="https://dadosabertos.rfb.gov.br/CNPJ/Estabelecimentos0.zip",
+        filename="Estabelecimentos0.zip",
+        kind="zip",
+        description=(
+            "Receita Federal - estabelecimentos (fatia 0): traz UF, CNAE e "
+            "situacao cadastral, ausentes no arquivo de empresas"
+        ),
+    ),
     "cvm": Source(
         key="cvm",
         url="https://dados.cvm.gov.br/dados/CIA_ABERTA/CAD/DADOS/cad_cia_aberta.csv",
@@ -199,6 +209,11 @@ def download_source(source: Source, force: bool = False) -> Path:
 def download_receita_federal(force: bool = False) -> Path:
     """Receita Federal - apenas Empresas0.zip (modo demo)."""
     return download_source(SOURCES["receita_federal"], force=force)
+
+
+def download_receita_federal_estabelecimentos(force: bool = False) -> Path:
+    """Receita Federal - Estabelecimentos0.zip (UF, CNAE e situacao cadastral)."""
+    return download_source(SOURCES["receita_federal_estabelecimentos"], force=force)
 
 
 def download_cvm(force: bool = False) -> Path:

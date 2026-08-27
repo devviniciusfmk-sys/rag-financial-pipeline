@@ -288,10 +288,26 @@ def _read_csv(
         keep_default_na=False,
         na_values=["", "NA", "NULL"],
         on_bad_lines="skip",
-        engine="python",
     )
     df.columns = [str(c).strip().lower() for c in df.columns]
     return df
+
+
+def _read_csv_chunks(handle: Any, columns: list[str], chunksize: int = 200_000):
+    """Mesmo dialeto de `_read_csv`, porem em blocos (arquivos de varios GB)."""
+    return pd.read_csv(
+        handle,
+        sep=SEPARATOR,
+        encoding=ENCODING,
+        header=None,
+        names=columns,
+        dtype=str,
+        quotechar='"',
+        keep_default_na=False,
+        na_values=["", "NA", "NULL"],
+        on_bad_lines="skip",
+        chunksize=chunksize,
+    )
 
 
 def _open_rfb_member(zip_path: Path, marker: str) -> tuple[str, Any] | None:
@@ -318,17 +334,18 @@ def load_receita_federal(
         logger.warning("receita federal: arquivo ausente em %s", zip_path)
         return pd.DataFrame(columns=RFB_EMPRESAS_COLUMNS)
 
-    if zip_path.suffix.lower() == ".zip":
-        member = _open_rfb_member(zip_path, "EMPRE")
-        if member is None:
-            logger.warning("receita federal: nenhum membro EMPRECSV em %s", zip_path)
-            return pd.DataFrame(columns=RFB_EMPRESAS_COLUMNS)
-        name, handle = member
-        logger.info("lendo %s::%s (limite=%s)", zip_path.name, name, limit or "sem teto")
-        with handle:
-            df = _read_csv(handle, columns=RFB_EMPRESAS_COLUMNS, limit=limit)
-    else:
-        df = _read_csv(zip_path, columns=RFB_EMPRESAS_COLUMNS, limit=limit)
+    # Fase 1: os estabelecimentos definem quais CNPJs entram no lote. Sem isso,
+    # as primeiras N linhas de cada arquivo nao se correspondem e o join resulta
+    # em quase nada -- que era a causa do "UF: NAO INFORMADO" em massa.
+    estab = _load_rfb_estabelecimentos(limit=limit)
+    keys: set[str] | None = None
+    if estab is not None and not estab.empty:
+        keys = set(estab["cnpj_basico"])
+        logger.info("receita federal: %d matrizes com UF/CNAE disponiveis", len(keys))
+
+    df = _read_rfb_empresas(zip_path, limit=limit, keys=keys)
+    if df.empty:
+        return pd.DataFrame(columns=RFB_EMPRESAS_COLUMNS)
 
     df = df.dropna(subset=["razao_social"])
     df["cnpj"] = df["cnpj_basico"].map(normalize_cnpj)
@@ -340,10 +357,14 @@ def load_receita_federal(
     )
     df = df[df["cnpj"] != ""]
 
-    estab = _load_rfb_estabelecimentos(limit=limit)
     if estab is not None and not estab.empty:
         df = df.merge(estab, on="cnpj_basico", how="left")
-        logger.info("receita federal: enriquecido com estabelecimentos")
+        enriquecidos = int(df["uf"].notna().sum()) if "uf" in df.columns else 0
+        logger.info(
+            "receita federal: %d/%d registros enriquecidos com UF/CNAE",
+            enriquecidos,
+            len(df),
+        )
 
     for col, default in (
         ("uf", NOT_INFORMED),
@@ -360,36 +381,126 @@ def load_receita_federal(
     return df
 
 
-def _load_rfb_estabelecimentos(limit: int | None = None) -> pd.DataFrame | None:
-    """Opcional: usa Estabelecimentos0.zip se o usuario tiver baixado.
+def _read_rfb_empresas(
+    zip_path: Path, limit: int | None, keys: set[str] | None
+) -> pd.DataFrame:
+    """Le o arquivo EMPRESAS, opcionalmente so os cnpj_basico em `keys`.
 
-    Recebe o limite ja resolvido por `_resolve_limit` (None = sem teto).
+    Sem `keys`, faz uma leitura direta com `nrows=limit`. Com `keys`, varre em
+    blocos e para assim que juntar `limit` empresas do conjunto pedido.
+    """
+    is_zip = zip_path.suffix.lower() == ".zip"
+
+    def _open():
+        if not is_zip:
+            return zip_path, None
+        member = _open_rfb_member(zip_path, "EMPRE")
+        if member is None:
+            return None, None
+        return member[1], member[0]
+
+    handle, member_name = _open()
+    if handle is None:
+        logger.warning("receita federal: nenhum membro EMPRECSV em %s", zip_path)
+        return pd.DataFrame(columns=RFB_EMPRESAS_COLUMNS)
+
+    logger.info(
+        "lendo %s%s (limite=%s%s)",
+        zip_path.name,
+        f"::{member_name}" if member_name else "",
+        limit or "sem teto",
+        ", filtrado por estabelecimentos" if keys else "",
+    )
+
+    if keys is None:
+        try:
+            return _read_csv(handle, columns=RFB_EMPRESAS_COLUMNS, limit=limit)
+        finally:
+            if member_name:
+                handle.close()
+
+    blocos: list[pd.DataFrame] = []
+    total = 0
+    try:
+        for bloco in _read_csv_chunks(handle, RFB_EMPRESAS_COLUMNS):
+            bloco.columns = [str(c).strip().lower() for c in bloco.columns]
+            filtrado = bloco[bloco["cnpj_basico"].isin(keys)]
+            if not filtrado.empty:
+                blocos.append(filtrado)
+                total += len(filtrado)
+            if limit and total >= limit:
+                break
+    finally:
+        if member_name:
+            handle.close()
+
+    if not blocos:
+        return pd.DataFrame(columns=RFB_EMPRESAS_COLUMNS)
+    df = pd.concat(blocos, ignore_index=True)
+    return df.head(limit) if limit else df
+
+
+def _load_rfb_estabelecimentos(limit: int | None = None) -> pd.DataFrame | None:
+    """Le Estabelecimentos*.zip, se presente, e devolve so as matrizes.
+
+    O arquivo tem varios GB e mistura matrizes e filiais, entao a leitura e
+    feita em blocos ate juntar `limit` matrizes (None = arquivo inteiro).
+    Recebe o limite ja resolvido por `_resolve_limit`.
     """
     candidates = list(RAW_DIR.glob("Estabelecimentos*.zip")) + list(
         RAW_DIR.glob("*ESTABELE*")
     )
     if not candidates:
+        logger.info(
+            "estabelecimentos ausente: UF/CNAE ficarao como '%s' "
+            "(baixe Estabelecimentos0.zip para enriquecer)",
+            NOT_INFORMED,
+        )
         return None
 
     target = candidates[0]
+    keep = ["cnpj_basico", "uf", "cnae_fiscal_principal", "situacao_cadastral"]
+    handle: Any = target
+    member_name: str | None = None
+
     try:
         if target.suffix.lower() == ".zip":
             member = _open_rfb_member(target, "ESTABELE")
             if member is None:
                 return None
-            _, handle = member
-            with handle:
-                df = _read_csv(handle, columns=RFB_ESTAB_COLUMNS, limit=limit)
-        else:
-            df = _read_csv(target, columns=RFB_ESTAB_COLUMNS, limit=limit)
-    except (zipfile.BadZipFile, OSError, ValueError) as exc:
+            member_name, handle = member[0], member[1]
+
+        matrizes: list[pd.DataFrame] = []
+        total = 0
+        for bloco in _read_csv_chunks(handle, RFB_ESTAB_COLUMNS):
+            bloco.columns = [str(c).strip().lower() for c in bloco.columns]
+            somente_matriz = bloco[
+                bloco["identificador_matriz_filial"].astype(str).str.strip() == "1"
+            ]
+            if not somente_matriz.empty:
+                matrizes.append(somente_matriz[keep])
+                total += len(somente_matriz)
+            if limit and total >= limit:
+                break
+    except (zipfile.BadZipFile, OSError, ValueError, KeyError) as exc:
         logger.warning("estabelecimentos ignorado (%s): %s", target.name, exc)
         return None
+    finally:
+        if member_name and hasattr(handle, "close"):
+            handle.close()
 
-    df = df[df["identificador_matriz_filial"].astype(str).str.strip() == "1"]
-    keep = ["cnpj_basico", "uf", "cnae_fiscal_principal", "situacao_cadastral"]
-    df = df[keep].drop_duplicates(subset=["cnpj_basico"])
-    df["uf"] = df["uf"].map(lambda v: clean_text(v).upper())
+    if not matrizes:
+        return None
+
+    df = pd.concat(matrizes, ignore_index=True)
+    if limit:
+        df = df.head(limit)
+    df = df.drop_duplicates(subset=["cnpj_basico"])
+    df["uf"] = df["uf"].map(lambda v: clean_text(v, default="").upper())
+    df["cnae_fiscal_principal"] = df["cnae_fiscal_principal"].map(
+        lambda v: clean_text(v, default="")
+    )
+    logger.info("estabelecimentos: %d matrizes lidas de %s", len(df), target.name)
     return df
 
 
@@ -468,7 +579,10 @@ def load_bacen(path: Path | None = None) -> pd.DataFrame:
                 "cnpj": cnpj,
                 "razao_social": name,
                 "situacao_desc": clean_text(item.get("Status"), default="Ativa"),
-                "uf": clean_text(item.get("City"), default=NOT_INFORMED).upper()[:40],
+                # O diretorio do Open Finance publica cidade, nao UF. Misturar as
+                # duas contaminava o agrupamento por estado com nomes de cidade.
+                "uf": NOT_INFORMED,
+                "municipio": clean_text(item.get("City"), default="").title()[:60],
                 "setor_atividade": "Instituicao participante do Open Finance Brasil",
                 "capital_social_num": 0.0,
                 "porte_desc": clean_text(item.get("Size"), default="Instituicao financeira"),

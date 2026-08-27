@@ -230,3 +230,61 @@ def test_limite_zero_le_tudo_e_limite_positivo_corta(cleaner_with_raw) -> None:
     # limit=0 (equivalente a --full) le todos os registros
     todos = cleaner_with_raw.build_all_chunks(limit=0)
     assert len(todos) == 6
+
+
+# --------------------------------------------------------------------------- #
+# Enriquecimento com Estabelecimentos (UF, CNAE, situacao cadastral)
+# --------------------------------------------------------------------------- #
+def test_estabelecimentos_preenchem_uf_e_cnae(cleaner_with_estab) -> None:
+    df = cleaner_with_estab.load_receita_federal(limit=100).set_index("cnpj_basico")
+
+    assert df.loc["00000000", "uf"] == "DF"
+    assert df.loc["00000000", "cnae_fiscal_principal"] == "6422100"
+    assert df.loc["00000000", "situacao_desc"] == "Ativa"
+    assert df.loc["11111111", "uf"] == "RS"
+    assert df.loc["11111111", "situacao_desc"] == "Baixada"
+
+
+def test_estabelecimentos_ignoram_filiais(cleaner_with_estab) -> None:
+    # A filial de 11111111 esta em SP; so a matriz (RS) pode valer.
+    estab = cleaner_with_estab._load_rfb_estabelecimentos(limit=None)
+    assert set(estab["cnpj_basico"]) == {"00000000", "11111111", "99999999"}
+    assert estab.set_index("cnpj_basico").loc["11111111", "uf"] == "RS"
+
+
+def test_uf_real_chega_ao_chunk(cleaner_with_estab) -> None:
+    chunks = [
+        c
+        for c in cleaner_with_estab.build_all_chunks(limit=100)
+        if c.metadata["source"] == "receita_federal"
+    ]
+    ufs = {c.metadata["uf"] for c in chunks}
+
+    assert ufs == {"DF", "RS"}
+    assert NOT_INFORMED not in ufs
+    assert "UF: DF" in next(c.text for c in chunks if c.metadata["uf"] == "DF")
+
+
+def test_sem_estabelecimentos_uf_fica_nao_informada(cleaner_with_raw) -> None:
+    df = cleaner_with_raw.load_receita_federal(limit=100)
+    assert set(df["uf"]) == {NOT_INFORMED}
+
+
+# --------------------------------------------------------------------------- #
+# Bacen: cidade nao pode contaminar o campo UF
+# --------------------------------------------------------------------------- #
+def test_bacen_cidade_vai_para_municipio(cleaner_with_raw) -> None:
+    df = cleaner_with_raw.load_bacen()
+
+    assert set(df["uf"]) == {NOT_INFORMED}
+    assert "Sao Paulo" in set(df["municipio"])
+
+
+def test_bacen_municipio_no_metadata_do_chunk(cleaner_with_raw) -> None:
+    chunk = next(
+        c
+        for c in cleaner_with_raw.build_all_chunks(limit=100)
+        if c.metadata["source"] == "bacen"
+    )
+    assert chunk.metadata["municipio"] == "Sao Paulo"
+    assert chunk.metadata["uf"] == NOT_INFORMED

@@ -266,3 +266,43 @@ def fake_store() -> FakeStore:
 @pytest.fixture
 def fake_generator() -> FakeGenerator:
     return FakeGenerator()
+
+
+# --------------------------------------------------------------------------- #
+# Estabelecimentos da Receita (UF, CNAE e situacao cadastral)
+# --------------------------------------------------------------------------- #
+def _estab_row(
+    cnpj_basico: str,
+    matriz: str,
+    situacao: str,
+    cnae: str,
+    uf: str,
+) -> str:
+    """Monta uma linha no layout de 30 colunas do arquivo ESTABELECIMENTOS."""
+    from ingestion.cleaner import RFB_ESTAB_COLUMNS
+
+    campos = [""] * len(RFB_ESTAB_COLUMNS)
+    campos[RFB_ESTAB_COLUMNS.index("cnpj_basico")] = cnpj_basico
+    campos[RFB_ESTAB_COLUMNS.index("identificador_matriz_filial")] = matriz
+    campos[RFB_ESTAB_COLUMNS.index("situacao_cadastral")] = situacao
+    campos[RFB_ESTAB_COLUMNS.index("cnae_fiscal_principal")] = cnae
+    campos[RFB_ESTAB_COLUMNS.index("uf")] = uf
+    return ";".join(f'"{c}"' for c in campos)
+
+
+ESTAB_CSV = "\n".join(
+    [
+        _estab_row("00000000", "1", "02", "6422100", "DF"),  # matriz ativa
+        _estab_row("11111111", "1", "08", "1091102", "RS"),  # matriz baixada
+        _estab_row("11111111", "2", "02", "1091102", "SP"),  # filial: ignorada
+        _estab_row("99999999", "1", "02", "6201500", "BA"),  # sem empresa no lote
+    ]
+) + "\n"
+
+
+@pytest.fixture
+def cleaner_with_estab(cleaner_with_raw, raw_dir: Path):
+    """raw_dir sintetico acrescido de Estabelecimentos0.zip."""
+    with zipfile.ZipFile(raw_dir / "Estabelecimentos0.zip", "w") as zf:
+        zf.writestr("K3241.K03200Y0.D40406.ESTABELE", ESTAB_CSV.encode("latin-1"))
+    return cleaner_with_raw
