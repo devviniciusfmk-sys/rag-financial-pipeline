@@ -59,7 +59,7 @@ POST /ask → "Which banks participate in Open Finance?"
 Live analytics over 22,637 indexed records
 from Receita Federal, CVM and Bacen Open Finance.
 
-![Dashboard](docs/dashboard-preview.png)
+![Dashboard](docs/dashboard-preview.jpg)
 
 > Run locally: `docker compose up -d` → http://localhost:3001
 > Card queries: [`docs/dashboard-queries.sql`](docs/dashboard-queries.sql)
