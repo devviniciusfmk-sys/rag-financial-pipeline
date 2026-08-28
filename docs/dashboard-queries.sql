@@ -76,3 +76,15 @@ SELECT metadata->>'razao_social' AS instituicao,
 FROM company_embeddings
 WHERE metadata->>'source' = 'bacen'
 ORDER BY 1;
+
+-- ---------------------------------------------------------------------------
+-- Card 5 — Participantes do Open Finance por segmento prudencial
+-- O campo `Size` do diretorio do Bacen e o segmento (S1/S2, SCD/SEP, IP...),
+-- guardado em metadata->>'segmento'. Nao confundir com o porte da Receita.
+-- ---------------------------------------------------------------------------
+SELECT COALESCE(NULLIF(metadata->>'segmento', ''), 'Nao informado') AS segmento,
+       COUNT(*) AS participantes
+FROM company_embeddings
+WHERE metadata->>'source' = 'bacen'
+GROUP BY 1
+ORDER BY 2 DESC;

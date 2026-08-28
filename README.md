@@ -7,7 +7,7 @@
 ![LangChain](https://img.shields.io/badge/LangChain-0.2-1C3C3C?style=flat-square&logo=langchain&logoColor=white)
 ![pgvector](https://img.shields.io/badge/pgvector-PostgreSQL-4169E1?style=flat-square&logo=postgresql&logoColor=white)
 ![OpenRouter](https://img.shields.io/badge/OpenRouter-multi--model-000000?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-94%20passing-1D9E75?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-103%20passing-1D9E75?style=flat-square)
 ![Docker](https://img.shields.io/badge/Docker-ready-2496ED?style=flat-square&logo=docker&logoColor=white)
 
 ## What it does
@@ -141,13 +141,13 @@ Response includes `model_used` and `fallback_used` fields for observability.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                          # 94 tests
+pytest                          # 103 tests
 pytest tests/test_cleaner.py -v
 ```
 
 | File | Tests | Covers |
 |---|---|---|
-| `test_cleaner.py` | 39 | CNPJ check digit, capital parsing, chunking, Estabelecimentos join, round-trip |
+| `test_cleaner.py` | 51 | CNPJ check digit, capital parsing, chunking, Estabelecimentos join, round-trip |
 | `test_embeddings.py` | 11 | Shape (n,384), float32, normalized, batch processing |
 | `test_api.py` | 18 | All endpoints, CORS, 422/500/502/503 error handling |
 | `test_chain.py` | 14 | Fallback, no-context guard, invalid key, all-fail |

@@ -288,3 +288,55 @@ def test_bacen_municipio_no_metadata_do_chunk(cleaner_with_raw) -> None:
     )
     assert chunk.metadata["municipio"] == "Sao Paulo"
     assert chunk.metadata["uf"] == NOT_INFORMED
+
+
+# --------------------------------------------------------------------------- #
+# Bacen: segmento prudencial separado de porte, municipio normalizado
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("entrada", "esperado"),
+    [
+        ("Sao Paulo, Sp", "Sao Paulo"),
+        ("Sao Paulo", "Sao Paulo"),
+        ("SAO PAULO, SP", "Sao Paulo"),
+        ("Porto Alegre, Rs", "Porto Alegre"),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_normalize_municipio_remove_uf_anexada(entrada, esperado) -> None:
+    from ingestion.cleaner import normalize_municipio
+
+    assert normalize_municipio(entrada) == esperado
+
+
+def test_bacen_segmento_nao_vira_porte(cleaner_with_raw) -> None:
+    df = cleaner_with_raw.load_bacen()
+
+    # "Large" veio do campo Size do diretorio: e segmento, nao porte da Receita.
+    assert df.iloc[0]["segmento"] == "Large"
+    assert set(df["porte_desc"]) == {"Instituicao financeira"}
+    # Sem classificacao de porte da Receita, porte_cod fica vazio (nao '05').
+    assert set(df["porte_cod"]) == {""}
+
+
+def test_bacen_segmento_no_metadata_e_no_texto(cleaner_with_raw) -> None:
+    chunk = next(
+        c
+        for c in cleaner_with_raw.build_all_chunks(limit=100)
+        if c.metadata["source"] == "bacen"
+    )
+
+    assert chunk.metadata["segmento"] == "Large"
+    assert chunk.metadata["porte"] == "Instituicao financeira"
+    # o segmento continua dentro do texto embeddado, via campo CNAE
+    assert "segmento Large" in chunk.text
+
+
+def test_build_all_chunks_filtra_por_fonte(cleaner_with_raw) -> None:
+    somente_bacen = cleaner_with_raw.build_all_chunks(limit=100, sources=["bacen"])
+    assert len(somente_bacen) == 2
+    assert {c.metadata["source"] for c in somente_bacen} == {"bacen"}
+
+    duas = cleaner_with_raw.build_all_chunks(limit=100, sources=["cvm", "bacen"])
+    assert {c.metadata["source"] for c in duas} == {"cvm", "bacen"}

@@ -6,6 +6,7 @@ Uso:
     python -m scripts.build_index --skip-download # reaproveita data/raw
     python -m scripts.build_index --reset         # limpa a tabela antes
     python -m scripts.build_index --full          # indexa tudo, sem teto
+    python -m scripts.build_index --only bacen --skip-download   # so uma fonte
 """
 
 from __future__ import annotations
@@ -64,6 +65,12 @@ def main() -> int:
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--reset", action="store_true", help="trunca a tabela antes")
     parser.add_argument("--force-download", action="store_true")
+    parser.add_argument(
+        "--only",
+        nargs="+",
+        choices=["receita_federal", "cvm", "bacen"],
+        help="reprocessa apenas estas fontes, substituindo-as no banco",
+    )
     args = parser.parse_args()
 
     started = time.perf_counter()
@@ -75,9 +82,11 @@ def main() -> int:
     if not args.skip_download:
         console.rule("[bold cyan]1/4 download")
         download_all(force=args.force_download)
+    else:
+        logger.info("download pulado (--skip-download)")
 
     console.rule("[bold cyan]2/4 limpeza e chunking")
-    chunks = build_all_chunks(limit=limit)
+    chunks = build_all_chunks(limit=limit, sources=args.only)
     if not chunks:
         logger.error("nenhum chunk gerado - verifique os arquivos em data/raw")
         return 1
@@ -89,6 +98,11 @@ def main() -> int:
     store.ensure_schema()
     if args.reset:
         store.truncate()
+    elif args.only:
+        # Substituicao cirurgica: remove so as fontes pedidas, preserva o resto.
+        for source in args.only:
+            removed = store.delete_by_source(source)
+            logger.info("removidos %d registros antigos de %s", removed, source)
     indexed = index_chunks(chunks, store, generator)
 
     console.rule("[bold cyan]4/4 resumo")

@@ -212,6 +212,18 @@ def format_capital(value: float) -> str:
     return formatted.replace(",", "_").replace(".", ",").replace("_", ".")
 
 
+def normalize_municipio(value: Any) -> str:
+    """"Sao Paulo, Sp" e "Sao Paulo" viram a mesma cidade.
+
+    O diretorio do Open Finance as vezes anexa a UF ao nome da cidade, o que
+    duplicava a mesma cidade em categorias diferentes nos agrupamentos.
+    """
+    text = clean_text(value, default="")
+    if not text:
+        return ""
+    return text.split(",")[0].strip().title()[:60]
+
+
 def map_porte(code: Any) -> str:
     raw = clean_text(code, default="")
     key = re.sub(r"\D", "", raw).zfill(2)[:2]
@@ -545,6 +557,13 @@ def load_cvm(path: Path | None = None, limit: int | None = None) -> pd.DataFrame
     return df
 
 
+def _bacen_setor(size: Any) -> str:
+    """Descricao usada no campo CNAE do chunk, preservando o segmento."""
+    segmento = clean_text(size, default="")
+    base = "Instituicao participante do Open Finance Brasil"
+    return f"{base} - segmento {segmento}" if segmento else base
+
+
 def load_bacen(path: Path | None = None) -> pd.DataFrame:
     """Le o diretorio de participantes do Open Finance (JSON)."""
     json_path = path or (RAW_DIR / "open_finance_participants.json")
@@ -582,11 +601,16 @@ def load_bacen(path: Path | None = None) -> pd.DataFrame:
                 # O diretorio do Open Finance publica cidade, nao UF. Misturar as
                 # duas contaminava o agrupamento por estado com nomes de cidade.
                 "uf": NOT_INFORMED,
-                "municipio": clean_text(item.get("City"), default="").title()[:60],
-                "setor_atividade": "Instituicao participante do Open Finance Brasil",
+                "municipio": normalize_municipio(item.get("City")),
+                # `Size` no diretorio do Open Finance e o segmento prudencial do
+                # Bacen (S1/S2, SCD/SEP, IP...), nao o porte da empresa. Vai para
+                # a chave propria `segmento` e continua visivel no texto do chunk.
+                "segmento": clean_text(item.get("Size"), default=""),
+                "setor_atividade": _bacen_setor(item.get("Size")),
                 "capital_social_num": 0.0,
-                "porte_desc": clean_text(item.get("Size"), default="Instituicao financeira"),
-                "porte_cod": "05",
+                "porte_desc": "Instituicao financeira",
+                # Sem classificacao de porte da Receita: nao inventamos '05'.
+                "porte_cod": "",
                 "organisation_id": clean_text(item.get("OrganisationId"), default=""),
                 "authorisation_servers": len(servers) if isinstance(servers, list) else 0,
                 "source": "bacen",
@@ -628,7 +652,13 @@ def _row_to_chunk(row: dict[str, Any]) -> Chunk | None:
         "capital_social": capital,
         "source": source,
     }
-    for optional in ("nome_fantasia", "municipio", "codigo_cvm", "organisation_id"):
+    for optional in (
+        "nome_fantasia",
+        "municipio",
+        "codigo_cvm",
+        "organisation_id",
+        "segmento",
+    ):
         value = row.get(optional)
         if value not in (None, "", NOT_INFORMED) and not pd.isna(value):
             metadata[optional] = clean_text(value)
@@ -660,17 +690,23 @@ def dedupe_chunks(chunks: Iterable[Chunk]) -> list[Chunk]:
     return unique
 
 
-def build_all_chunks(limit: int | None = None) -> list[Chunk]:
-    """Le todas as fontes disponiveis em data/raw e devolve os chunks.
+def build_all_chunks(
+    limit: int | None = None, sources: list[str] | None = None
+) -> list[Chunk]:
+    """Le as fontes disponiveis em data/raw e devolve os chunks.
 
     `limit=None` ou `limit<=0` processam todos os registros de cada fonte.
+    `sources` restringe quais fontes processar (default: todas).
     """
     chunks: list[Chunk] = []
-    for name, loader in (
+    loaders = (
         ("receita_federal", lambda: load_receita_federal(limit=limit)),
         ("cvm", lambda: load_cvm(limit=limit)),
         ("bacen", load_bacen),
-    ):
+    )
+    if sources:
+        loaders = tuple(item for item in loaders if item[0] in set(sources))
+    for name, loader in loaders:
         try:
             df = loader()
         except (OSError, ValueError, KeyError) as exc:
