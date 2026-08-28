@@ -56,11 +56,10 @@ POST /ask → "Which banks participate in Open Finance?"
 
 ## Dashboard
 
-> Live analytics powered by Metabase over the indexed data.
+Live analytics over 22,637 indexed records
+from Receita Federal, CVM and Bacen Open Finance.
 
-Run `docker compose up -d` and open `http://localhost:3001`. Connect Metabase to
-`Host: postgres / Port: 5432 / Database: postgres` and paste the queries from
-[`docs/dashboard-queries.sql`](docs/dashboard-queries.sql).
+> Run locally: `docker compose up -d` → http://localhost:3001
 
 ## Data Sources
 
