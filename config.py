@@ -37,9 +37,9 @@ class Settings(BaseSettings):
     openrouter_base_url: str = Field(
         default="https://openrouter.ai/api/v1", alias="OPENROUTER_BASE_URL"
     )
-    llm_model: str = Field(default="nvidia/nemotron-3-ultra:free", alias="LLM_MODEL")
+    llm_model: str = Field(default="nvidia/nemotron-3-ultra-550b-a55b:free", alias="LLM_MODEL")
     fallback_model: str = Field(
-        default="meta-llama/llama-3.3-70b:free", alias="FALLBACK_MODEL"
+        default="google/gemma-4-31b-it:free", alias="FALLBACK_MODEL"
     )
     embedding_model: str = Field(default="all-MiniLM-L6-v2", alias="EMBEDDING_MODEL")
 

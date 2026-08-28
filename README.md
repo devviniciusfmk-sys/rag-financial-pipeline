@@ -131,9 +131,9 @@ curl -s localhost:8000/ask \
 The pipeline uses OpenRouter with automatic fallback:
 
 ```
-Primary model (nvidia/nemotron-3-ultra:free)
+Primary model (nvidia/nemotron-3-ultra-550b-a55b:free)
         ↓ rate limit / timeout / unavailable
-Fallback model (meta-llama/llama-3.3-70b:free)
+Fallback model (google/gemma-4-31b-it:free)
         ↓ both fail
 RuntimeError with full context preserved
 ```
