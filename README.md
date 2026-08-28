@@ -7,7 +7,7 @@
 ![LangChain](https://img.shields.io/badge/LangChain-0.2-1C3C3C?style=flat-square&logo=langchain&logoColor=white)
 ![pgvector](https://img.shields.io/badge/pgvector-PostgreSQL-4169E1?style=flat-square&logo=postgresql&logoColor=white)
 ![OpenRouter](https://img.shields.io/badge/OpenRouter-multi--model-000000?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-103%20passing-1D9E75?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-115%20passing-1D9E75?style=flat-square)
 ![Docker](https://img.shields.io/badge/Docker-ready-2496ED?style=flat-square&logo=docker&logoColor=white)
 
 ## What it does
@@ -35,7 +35,7 @@ POST /ask → "Which banks participate in Open Finance?"
                          │
                          ▼
               embeddings/generator.py
-              (all-MiniLM-L6-v2 · 384 dims · batches of 32)
+              (paraphrase-multilingual-MiniLM-L12-v2 · 384 dims · batches of 32)
                          │
                          ▼
               embeddings/store.py
@@ -43,7 +43,7 @@ POST /ask → "Which banks participate in Open Finance?"
                          │
                          ▼
               retrieval/search.py
-              (semantic search · CNPJ exact match shortcut)
+              (hybrid: cosine + trigram on name/text + prefix bonus)
                          │
                          ▼
               pipeline/chain.py
@@ -144,15 +144,15 @@ Response includes `model_used` and `fallback_used` fields for observability.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                          # 103 tests
+pytest                          # 115 tests
 pytest tests/test_cleaner.py -v
 ```
 
 | File | Tests | Covers |
 |---|---|---|
-| `test_cleaner.py` | 51 | CNPJ check digit, capital parsing, chunking, Estabelecimentos join, round-trip |
-| `test_embeddings.py` | 11 | Shape (n,384), float32, normalized, batch processing |
-| `test_api.py` | 18 | All endpoints, CORS, 422/500/502/503 error handling |
+| `test_cleaner.py` | 56 | CNPJ check digit, capital parsing, chunking, Estabelecimentos join, round-trip |
+| `test_embeddings.py` | 16 | Shape (n,384), float32, normalized, batch processing |
+| `test_api.py` | 20 | All endpoints, CORS, 422/500/502/503 error handling |
 | `test_chain.py` | 14 | Fallback, no-context guard, invalid key, all-fail |
 | `test_downloader.py` | 12 | RFB share discovery, URL building, zip/JSON validation, zip-slip |
 
@@ -167,7 +167,7 @@ Table `company_embeddings`:
 | `id` | BIGSERIAL PK | |
 | `cnpj` | VARCHAR(14) | normalized, no punctuation |
 | `text_chunk` | TEXT | human-readable company description |
-| `embedding` | vector(384) | all-MiniLM-L6-v2 |
+| `embedding` | vector(384) | paraphrase-multilingual-MiniLM-L12-v2 |
 | `metadata` | JSONB | source, uf, cnae, porte, situacao |
 | `created_at` | TIMESTAMPTZ | |
 
@@ -175,7 +175,11 @@ Indexes: `ivfflat (embedding vector_cosine_ops)`, GIN on `metadata`, unique on `
 
 ## Key Engineering Decisions
 
-**Why local embeddings?** `all-MiniLM-L6-v2` runs on CPU, costs $0, and produces 384-dim vectors sufficient for Portuguese company descriptions. No API dependency in the embedding layer.
+**Why local embeddings?** `paraphrase-multilingual-MiniLM-L12-v2` runs on CPU, costs $0, and produces 384-dim vectors. The English-only `all-MiniLM-L6-v2` was tried first and scored 0.34 on a query as direct as "Nu Pagamentos" — Portuguese needs a multilingual model.
+
+**Why hybrid search?** Vector search alone missed exact company names ("Itau Unibanco" returned nothing). Three lexical signals are added to the cosine score: `word_similarity` on the company name, `word_similarity` on the chunk text (catches literal terms like "Open Finance" that live in the text but not in the name), and a prefix bonus. `word_similarity` rather than `similarity`: the latter compares whole strings, scoring "Nu Pagamentos" against "Nu Pagamentos S.A. - Instituicao De Pagamento" at 0.412 — tied with the unrelated "Pagamentos Limitados Ltda" (0.407). Every component is returned per hit.
+
+**Why separate embed text from display text?** Every chunk shares the same template, and that boilerplate dominated the vector: short queries landed far from every document. The embedded text carries only the discriminating content ("Nu Pagamentos S.A. - instituicao de pagamento, Open Finance, segmento S1/S2"), while the readable template is what the API returns.
 
 **Why pgvector over FAISS?** Persistent storage, SQL filters and idempotent upserts.
 

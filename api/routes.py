@@ -81,6 +81,8 @@ class AskResponse(BaseModel):
 
 class SearchItem(BaseModel):
     cnpj: str = ""
+    vector_score: float = 0.0
+    name_score: float = 0.0
     cnpj_formatado: str = ""
     razao_social: str = ""
     score: float = 0.0
@@ -159,7 +161,7 @@ def search(
     uf: str | None = Query(None, max_length=2),
     porte: str | None = Query(None, max_length=40),
     source: str | None = Query(None, max_length=40),
-    min_score: float = Query(0.0, ge=-1.0, le=1.0),
+    min_score: float = Query(-1.0, ge=-1.0, le=1.0),
     engine: SemanticSearch = Depends(get_search),
 ) -> list[SearchItem]:
     try:
@@ -183,6 +185,8 @@ def search(
             cnpj_formatado=hit.get("cnpj_formatado", ""),
             razao_social=hit.get("razao_social", ""),
             score=round(float(hit.get("score", 0.0)), 4),
+            vector_score=round(float(hit.get("vector_score", 0.0)), 4),
+            name_score=round(float(hit.get("name_score", 0.0)), 4),
             uf=hit.get("uf", ""),
             porte=hit.get("porte", ""),
             situacao=hit.get("situacao", ""),

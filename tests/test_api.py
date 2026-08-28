@@ -251,3 +251,15 @@ def test_ask_falha_do_llm_vira_502(client: TestClient, chain: FakeChain) -> None
 
     assert resposta.status_code == 502
     assert "todos os modelos falharam" in resposta.json()["detail"]
+
+
+def test_search_nao_corta_candidatos_por_padrao(client: TestClient) -> None:
+    """min_score default -1.0: consulta ruim devolve os melhores, nao vazio."""
+    resposta = client.get("/search", params={"q": "termo improvavel xyz", "limit": 3})
+    assert resposta.status_code == 200
+    assert len(resposta.json()) > 0
+
+
+def test_search_expoe_componentes_do_score_hibrido(client: TestClient) -> None:
+    item = client.get("/search", params={"q": "nubank"}).json()[0]
+    assert "vector_score" in item and "name_score" in item

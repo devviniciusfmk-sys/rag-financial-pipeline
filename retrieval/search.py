@@ -33,9 +33,13 @@ class SemanticSearch:
         uf: str | None = None,
         porte: str | None = None,
         source: str | None = None,
-        min_score: float = 0.0,
+        min_score: float = -1.0,
     ) -> list[dict[str, Any]]:
         """Retorna os `top_k` chunks mais similares a `query`.
+
+        Busca hibrida: o texto da consulta vai tambem para o casamento por
+        trigrama na razao social, o que resolve nomes proprios que o vetor
+        sozinho erra. `min_score=-1.0` nunca devolve lista vazia por corte.
 
         Cada item: cnpj, razao_social, score, text_chunk, uf, porte, situacao,
         cnae, capital_social, source e metadata completa.
@@ -58,6 +62,7 @@ class SemanticSearch:
             porte=porte,
             source=source,
             min_score=min_score,
+            query_text=cleaned,
         )
         results = [self._format(row) for row in rows]
         logger.debug("busca '%s' -> %d resultado(s)", cleaned[:60], len(results))
@@ -91,6 +96,8 @@ class SemanticSearch:
             "cnpj_formatado": metadata.get("cnpj_formatado", ""),
             "razao_social": metadata.get("razao_social", ""),
             "score": float(row.get("score") or 0.0),
+            "vector_score": float(row.get("vector_score") or 0.0),
+            "name_score": float(row.get("name_score") or 0.0),
             "uf": metadata.get("uf", ""),
             "porte": metadata.get("porte", ""),
             "situacao": metadata.get("situacao", ""),

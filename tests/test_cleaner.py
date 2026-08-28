@@ -199,7 +199,7 @@ def test_save_e_load_chunks_roundtrip(cleaner_with_raw, tmp_path) -> None:
 
     linhas = destino.read_text(encoding="utf-8").strip().splitlines()
     assert len(linhas) == len(chunks)
-    assert set(json.loads(linhas[0])) == {"cnpj", "text", "metadata"}
+    assert set(json.loads(linhas[0])) == {"cnpj", "text", "metadata", "embed_text"}
 
     recarregados = list(load_chunks(destino))
     assert recarregados == chunks
@@ -340,3 +340,62 @@ def test_build_all_chunks_filtra_por_fonte(cleaner_with_raw) -> None:
 
     duas = cleaner_with_raw.build_all_chunks(limit=100, sources=["cvm", "bacen"])
     assert {c.metadata["source"] for c in duas} == {"cvm", "bacen"}
+
+
+# --------------------------------------------------------------------------- #
+# Texto de embedding separado do texto de exibicao
+# --------------------------------------------------------------------------- #
+def test_embed_text_descarta_boilerplate_e_campos_vazios() -> None:
+    from ingestion.cleaner import build_embed_text
+
+    texto = build_embed_text(
+        razao_social="Nu Pagamentos S.A.",
+        cnae="Instituicao participante do Open Finance Brasil",
+        porte="Instituicao financeira",
+        uf=NOT_INFORMED,
+        municipio="Sao Paulo",
+        segmento="S1/S2",
+        situacao="Active",
+    )
+    assert texto.startswith("Nu Pagamentos S.A. -")
+    assert "segmento S1/S2" in texto and "Sao Paulo" in texto
+    # nada de rotulos fixos nem campos vazios
+    for ausente in ("Empresa:", "CNPJ:", "Capital:", "UF:", NOT_INFORMED):
+        assert ausente not in texto
+
+
+def test_embed_text_sem_extras_e_so_o_nome() -> None:
+    from ingestion.cleaner import build_embed_text
+
+    assert build_embed_text("Acme Ltda", NOT_INFORMED, NOT_INFORMED, NOT_INFORMED) == "Acme Ltda"
+
+
+def test_chunk_tem_texto_de_exibicao_e_de_embedding(cleaner_with_raw) -> None:
+    chunk = next(
+        c
+        for c in cleaner_with_raw.build_all_chunks(limit=100)
+        if c.metadata["source"] == "bacen"
+    )
+    # exibicao mantem o template completo
+    assert chunk.text.startswith("Empresa:") and "Capital: R$" in chunk.text
+    # embedding e enxuto e diferente
+    assert chunk.embed_text != chunk.text
+    assert "Empresa:" not in chunk.embed_text
+    assert chunk.metadata["razao_social"].split()[0] in chunk.embed_text
+
+
+def test_chunk_sem_embed_text_cai_no_texto_completo() -> None:
+    from ingestion.cleaner import Chunk
+
+    c = Chunk(cnpj="00000000000191", text="Empresa: X. CNPJ: Y")
+    assert c.embed_text == c.text
+
+
+def test_roundtrip_preserva_embed_text(cleaner_with_raw, tmp_path) -> None:
+    chunks = cleaner_with_raw.build_all_chunks(limit=100)
+    destino = tmp_path / "chunks.jsonl"
+    save_chunks(chunks, destino)
+    recarregados = list(load_chunks(destino))
+
+    assert recarregados == chunks
+    assert all(c.embed_text and c.embed_text != c.text for c in recarregados)

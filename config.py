@@ -41,7 +41,9 @@ class Settings(BaseSettings):
     fallback_model: str = Field(
         default="google/gemma-4-31b-it:free", alias="FALLBACK_MODEL"
     )
-    embedding_model: str = Field(default="all-MiniLM-L6-v2", alias="EMBEDDING_MODEL")
+    embedding_model: str = Field(
+        default="paraphrase-multilingual-MiniLM-L12-v2", alias="EMBEDDING_MODEL"
+    )
 
     api_host: str = Field(default="0.0.0.0", alias="API_HOST")
     api_port: int = Field(default=8000, alias="API_PORT")

@@ -42,7 +42,10 @@ def index_chunks(
     batches = range(0, len(chunks), DB_BATCH)
     for start in tqdm(list(batches), desc="indexando", unit="lote"):
         batch = chunks[start : start + DB_BATCH]
-        vectors = generator.generate([c.text for c in batch], show_progress=False)
+        # embeda o texto enxuto; o template completo continua sendo o exibido
+        vectors = generator.generate(
+            [c.embed_text for c in batch], show_progress=False
+        )
         records = [
             (chunk.cnpj, chunk.text, vectors[i], chunk.metadata)
             for i, chunk in enumerate(batch)
@@ -104,6 +107,8 @@ def main() -> int:
             removed = store.delete_by_source(source)
             logger.info("removidos %d registros antigos de %s", removed, source)
     indexed = index_chunks(chunks, store, generator)
+
+    store.rebuild_vector_index()
 
     console.rule("[bold cyan]4/4 resumo")
     stats = store.stats()

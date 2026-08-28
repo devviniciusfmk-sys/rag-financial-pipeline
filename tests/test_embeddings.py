@@ -117,3 +117,87 @@ def test_ddl_declara_dimensao_e_indices() -> None:
     assert "created_at  TIMESTAMPTZ" in ddl
     assert "ivfflat (embedding vector_cosine_ops)" in ddl
     assert f"{TABLE_NAME}_cnpj_chunk_uidx" in ddl  # upsert idempotente
+
+
+# --------------------------------------------------------------------------- #
+# Busca hibrida (SQL montado sem conexao)
+# --------------------------------------------------------------------------- #
+def test_ddl_cria_indice_trigrama_para_nomes() -> None:
+    ddl = "\n".join(s.format(table=TABLE_NAME, dim=EXPECTED_DIM) for s in DDL_STATEMENTS)
+    assert "CREATE EXTENSION IF NOT EXISTS pg_trgm" in ddl
+    assert "gin ((metadata->>'razao_social') gin_trgm_ops)" in ddl
+
+
+def test_build_search_query_ordem_dos_placeholders() -> None:
+    """13 placeholders em 4 sinais: trocar dois corrompe o ranking em silencio."""
+    from embeddings.store import build_search_query
+
+    sql, params = build_search_query(
+        table="company_embeddings",
+        vector_literal="[0.1,0.2]",
+        query_text="Nu Pagamentos",
+        filters={"uf": "sp", "porte": None, "source": None},
+        top_k=5,
+    )
+
+    assert sql.count("%s") == len(params) == 13
+    # SELECT: vetor, nome, texto, prefixo
+    assert params[:4] == ["[0.1,0.2]", "Nu Pagamentos", "Nu Pagamentos", "Nu Pagamentos%"]
+    # WHERE: uf normalizada
+    assert params[4] == "SP"
+    # ORDER BY: vetor, (peso,nome), (peso,texto), (peso,prefixo), limite
+    assert params[5:] == [
+        "[0.1,0.2]",
+        0.4, "Nu Pagamentos",
+        0.6, "Nu Pagamentos",
+        0.4, "Nu Pagamentos%",
+        5,
+    ]
+
+
+def test_build_search_query_sem_texto_zera_os_pesos_lexicais() -> None:
+    from embeddings.store import build_search_query
+
+    sql, params = build_search_query(
+        table="company_embeddings",
+        vector_literal="[0.1]",
+        query_text=None,
+        filters={},
+        top_k=3,
+    )
+    assert sql.count("%s") == len(params)
+    assert 0.4 not in params and 0.6 not in params  # so o cosseno pontua
+    assert "~~sem-prefixo~~" in params  # padrao que nao casa com nada
+
+
+def test_build_search_query_usa_os_quatro_sinais() -> None:
+    from embeddings.store import build_search_query
+
+    sql, _ = build_search_query(
+        table="company_embeddings",
+        vector_literal="[0.1]",
+        query_text="itau",
+        filters={},
+        top_k=3,
+    )
+    assert "embedding <=>" in sql
+    assert "word_similarity(%s, COALESCE(metadata->>'razao_social', ''))" in sql
+    assert "word_similarity(%s, text_chunk)" in sql
+    assert "ILIKE %s)::int" in sql
+    # similarity() inteira empatava nome longo com lixo; tem que ser word_similarity
+    assert "similarity(COALESCE" not in sql
+
+
+def test_build_search_query_aplica_filtros_estruturados() -> None:
+    from embeddings.store import build_search_query
+
+    sql, params = build_search_query(
+        table="company_embeddings",
+        vector_literal="[0.1]",
+        query_text=None,
+        filters={"uf": "RS", "porte": "01", "source": "bacen"},
+        top_k=1,
+    )
+    assert "metadata->>'uf' = %s" in sql
+    assert "metadata->>'source' = %s" in sql
+    assert params[4:8] == ["RS", "01", "01", "bacen"]

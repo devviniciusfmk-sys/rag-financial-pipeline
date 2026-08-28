@@ -114,11 +114,21 @@ CVM_SITUACAO_MAP = {
 
 @dataclass
 class Chunk:
-    """Unidade de texto que sera vetorizada."""
+    """Unidade de texto do indice.
+
+    `text` e o que se mostra ao usuario (template completo, legivel).
+    `embed_text` e o que vira vetor: so o conteudo discriminante, sem o
+    boilerplate que se repete em todos os registros e dilui o embedding.
+    """
 
     cnpj: str
     text: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    embed_text: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.embed_text:
+            self.embed_text = self.text
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -258,6 +268,43 @@ def build_chunk_text(
         f"UF: {uf}. "
         f"Capital: R$ {format_capital(capital)}"
     )
+
+
+def build_embed_text(
+    razao_social: str,
+    cnae: str,
+    porte: str,
+    uf: str,
+    municipio: str = "",
+    segmento: str = "",
+    situacao: str = "",
+) -> str:
+    """Texto enxuto que vai para o vetor.
+
+    Sem rotulos fixos e sem campos vazios: o template completo era identico em
+    todos os 22 mil registros, dominava o embedding e afundava a similaridade
+    de consultas curtas como "Nu Pagamentos".
+
+    Ex.: "Nu Pagamentos S.A. - instituicao de pagamento, Open Finance,
+          segmento S1/S2, Sao Paulo"
+    """
+    partes = [razao_social.strip()]
+    extras = [
+        cnae,
+        segmento and f"segmento {segmento}",
+        porte,
+        municipio,
+        uf if uf and uf != NOT_INFORMED else "",
+        situacao if situacao and situacao not in {NOT_INFORMED, "Ativa"} else "",
+    ]
+    limpos = [
+        str(e).strip()
+        for e in extras
+        if e and str(e).strip() and str(e).strip() != NOT_INFORMED
+    ]
+    vistos: set[str] = set()
+    unicos = [e for e in limpos if not (e.lower() in vistos or vistos.add(e.lower()))]
+    return f"{partes[0]} - {', '.join(unicos)}" if unicos else partes[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -641,6 +688,15 @@ def _row_to_chunk(row: dict[str, Any]) -> Chunk | None:
     source = str(row.get("source") or "desconhecida")
 
     text = build_chunk_text(razao_social, cnpj, situacao, cnae, porte, uf, capital)
+    embed_text = build_embed_text(
+        razao_social=razao_social,
+        cnae=cnae,
+        porte=porte,
+        uf=uf,
+        municipio=str(row.get("municipio") or ""),
+        segmento=str(row.get("segmento") or ""),
+        situacao=situacao,
+    )
     metadata = {
         "razao_social": razao_social,
         "cnpj_formatado": format_cnpj(cnpj),
@@ -662,7 +718,7 @@ def _row_to_chunk(row: dict[str, Any]) -> Chunk | None:
         value = row.get(optional)
         if value not in (None, "", NOT_INFORMED) and not pd.isna(value):
             metadata[optional] = clean_text(value)
-    return Chunk(cnpj=cnpj, text=text, metadata=metadata)
+    return Chunk(cnpj=cnpj, text=text, metadata=metadata, embed_text=embed_text)
 
 
 def dataframe_to_chunks(df: pd.DataFrame) -> list[Chunk]:
@@ -744,7 +800,10 @@ def load_chunks(path: Path | None = None) -> Iterator[Chunk]:
                 continue
             data = json.loads(line)
             yield Chunk(
-                cnpj=data["cnpj"], text=data["text"], metadata=data.get("metadata", {})
+                cnpj=data["cnpj"],
+                text=data["text"],
+                metadata=data.get("metadata", {}),
+                embed_text=data.get("embed_text", ""),
             )
 
 

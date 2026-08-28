@@ -35,6 +35,9 @@ DDL_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS {table}_cnpj_idx ON {table} (cnpj)",
     "CREATE INDEX IF NOT EXISTS {table}_metadata_gin "
     "ON {table} USING gin (metadata jsonb_path_ops)",
+    "CREATE EXTENSION IF NOT EXISTS pg_trgm",
+    "CREATE INDEX IF NOT EXISTS {table}_razao_trgm "
+    "ON {table} USING gin ((metadata->>'razao_social') gin_trgm_ops)",
     "CREATE INDEX IF NOT EXISTS {table}_vec_idx "
     "ON {table} USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)",
 )
@@ -44,6 +47,74 @@ def to_vector_literal(vector: Sequence[float] | np.ndarray) -> str:
     """Converte um vetor em literal aceito por pgvector: '[0.1,0.2,...]'."""
     array = np.asarray(vector, dtype=np.float32).ravel()
     return "[" + ",".join(f"{float(x):.7g}" for x in array) + "]"
+
+
+def build_search_query(
+    table: str,
+    vector_literal: str,
+    query_text: str | None,
+    filters: dict[str, Any],
+    top_k: int,
+    name_weight: float = 0.4,
+    text_weight: float = 0.6,
+    prefix_weight: float = 0.4,
+) -> tuple[str, list[Any]]:
+    """Monta o SQL da busca hibrida e a lista de parametros na ordem correta.
+
+    Funcao pura, separada de `VectorStore.search` para poder ser testada sem
+    banco: sao 12 placeholders em 4 sinais, e trocar a ordem de dois deles
+    corrompe o ranking silenciosamente.
+    """
+    where_parts: list[str] = []
+    filter_params: list[Any] = []
+    if filters.get("uf"):
+        where_parts.append("metadata->>'uf' = %s")
+        filter_params.append(str(filters["uf"]).upper())
+    if filters.get("porte"):
+        where_parts.append("(metadata->>'porte_cod' = %s OR metadata->>'porte' = %s)")
+        filter_params.extend([filters["porte"], filters["porte"]])
+    if filters.get("source"):
+        where_parts.append("metadata->>'source' = %s")
+        filter_params.append(filters["source"])
+    where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+    term = query_text.strip() if query_text and query_text.strip() else None
+    w_name = float(name_weight) if term else 0.0
+    w_text = float(text_weight) if term else 0.0
+    w_prefix = float(prefix_weight) if term else 0.0
+    prefix_pattern = f"{term}%" if term else "~~sem-prefixo~~"
+
+    query = f"""
+        SELECT id,
+               cnpj,
+               text_chunk,
+               metadata,
+               created_at,
+               1 - (embedding <=> %s::vector) AS vector_score,
+               word_similarity(%s, COALESCE(metadata->>'razao_social', '')) AS name_score,
+               word_similarity(%s, text_chunk) AS text_score,
+               (COALESCE(metadata->>'razao_social', '') ILIKE %s)::int AS prefix_hit
+        FROM {table}
+        {where}
+        ORDER BY (1 - (embedding <=> %s::vector))
+                 + %s * word_similarity(%s, COALESCE(metadata->>'razao_social', ''))
+                 + %s * word_similarity(%s, text_chunk)
+                 + %s * (COALESCE(metadata->>'razao_social', '') ILIKE %s)::int
+                 DESC
+        LIMIT %s
+    """
+    params = (
+        [vector_literal, term or "", term or "", prefix_pattern]
+        + filter_params
+        + [
+            vector_literal,
+            w_name, term or "",
+            w_text, term or "",
+            w_prefix, prefix_pattern,
+            int(top_k),
+        ]
+    )
+    return query, params
 
 
 class VectorStore:
@@ -111,6 +182,22 @@ class VectorStore:
             for statement in DDL_STATEMENTS:
                 cur.execute(statement.format(table=TABLE_NAME, dim=self.dimension))
         logger.info("schema pronto: %s (vector(%d))", TABLE_NAME, self.dimension)
+
+    def rebuild_vector_index(self) -> None:
+        """Recria o indice ivfflat com os dados ja carregados.
+
+        O ivfflat calcula os centroides no momento da criacao: construido sobre
+        tabela vazia, ele nasce sem particionamento util. Recriar depois da
+        carga e o que a documentacao do pgvector recomenda.
+        """
+        with self.cursor(dict_rows=False) as cur:
+            cur.execute(f"DROP INDEX IF EXISTS {TABLE_NAME}_vec_idx")
+            cur.execute(
+                f"CREATE INDEX {TABLE_NAME}_vec_idx ON {TABLE_NAME} "
+                "USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)"
+            )
+            cur.execute(f"ANALYZE {TABLE_NAME}")
+        logger.info("indice vetorial reconstruido sobre os dados carregados")
 
     def health(self) -> dict[str, Any]:
         """Checagem usada pelo endpoint /health."""
@@ -222,45 +309,61 @@ class VectorStore:
         uf: str | None = None,
         porte: str | None = None,
         source: str | None = None,
-        min_score: float = 0.0,
+        min_score: float = -1.0,
+        query_text: str | None = None,
+        name_weight: float = 0.4,
+        text_weight: float = 0.6,
+        prefix_weight: float = 0.4,
     ) -> list[dict[str, Any]]:
-        """Busca por similaridade de cosseno. Score = 1 - distancia (0..1)."""
-        filters: list[str] = []
-        params: list[Any] = [to_vector_literal(query_embedding)]
+        """Busca hibrida: cosseno no embedding + trigrama na razao social.
 
-        if uf:
-            filters.append("metadata->>'uf' = %s")
-            params.append(uf.upper())
-        if porte:
-            filters.append("(metadata->>'porte_cod' = %s OR metadata->>'porte' = %s)")
-            params.extend([porte, porte])
-        if source:
-            filters.append("metadata->>'source' = %s")
-            params.append(source)
+        O vetor sozinho erra nomes proprios ("Itau Unibanco" nao casava com
+        nada); o trigrama sozinho nao entende semantica. O score final e
+        `vetor + name_weight * similaridade_do_nome`, e ambos os componentes
+        voltam no resultado para inspecao.
 
-        where = f"WHERE {' AND '.join(filters)}" if filters else ""
-        params.extend([to_vector_literal(query_embedding), int(top_k)])
+        Usa `word_similarity` e nao `similarity`: a segunda compara as strings
+        inteiras, entao "Nu Pagamentos" contra "Nu Pagamentos S.A. - Instituicao
+        De Pagamento" dava 0.412 -- empatado com "Pagamentos Limitados Ltda"
+        (0.407). `word_similarity` procura a melhor subsequencia dentro do alvo
+        e da 1.000 para o primeiro, 0.786 para o segundo.
 
-        query = f"""
-            SELECT id,
-                   cnpj,
-                   text_chunk,
-                   metadata,
-                   created_at,
-                   1 - (embedding <=> %s::vector) AS score
-            FROM {TABLE_NAME}
-            {where}
-            ORDER BY embedding <=> %s::vector
-            LIMIT %s
+        Quatro sinais somados:
+          * cosseno do embedding (semantica)
+          * trigrama na razao social (nome proprio)
+          * trigrama no texto do chunk (termo literal como "Open Finance",
+            que aparece no texto mas nao no nome da instituicao)
+          * bonus de prefixo exato na razao social
+
+        `min_score` filtra pelo score do vetor; o default -1.0 nao descarta
+        nada, para nunca devolver lista vazia quando ha candidatos ruins.
         """
+        term = query_text.strip() if query_text and query_text.strip() else None
+        weight = float(name_weight) if term else 0.0
+        text_weight = float(text_weight) if term else 0.0
+        prefix_weight = float(prefix_weight) if term else 0.0
+
+        query, params = build_search_query(
+            table=TABLE_NAME,
+            vector_literal=to_vector_literal(query_embedding),
+            query_text=query_text,
+            filters={"uf": uf, "porte": porte, "source": source},
+            top_k=top_k,
+            name_weight=name_weight,
+            text_weight=text_weight,
+            prefix_weight=prefix_weight,
+        )
         with self.cursor() as cur:
             cur.execute(query, params)
             rows = cur.fetchall()
 
         results: list[dict[str, Any]] = []
         for row in rows:
-            score = float(row["score"])
-            if score < min_score:
+            vector_score = float(row["vector_score"])
+            name_score = float(row["name_score"] or 0.0)
+            text_score = float(row["text_score"] or 0.0)
+            prefix_hit = int(row["prefix_hit"] or 0)
+            if vector_score < min_score:
                 continue
             metadata = row["metadata"] or {}
             results.append(
@@ -268,7 +371,17 @@ class VectorStore:
                     "id": int(row["id"]),
                     "cnpj": row["cnpj"],
                     "text_chunk": row["text_chunk"],
-                    "score": round(score, 4),
+                    "score": round(
+                        vector_score
+                        + weight * name_score
+                        + text_weight * text_score
+                        + prefix_weight * prefix_hit,
+                        4,
+                    ),
+                    "vector_score": round(vector_score, 4),
+                    "name_score": round(name_score, 4),
+                    "text_score": round(text_score, 4),
+                    "prefix_hit": prefix_hit,
                     "metadata": metadata,
                     "created_at": row["created_at"].isoformat()
                     if row.get("created_at")
