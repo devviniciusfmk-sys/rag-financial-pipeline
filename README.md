@@ -7,7 +7,7 @@
 ![LangChain](https://img.shields.io/badge/LangChain-0.2-1C3C3C?style=flat-square&logo=langchain&logoColor=white)
 ![pgvector](https://img.shields.io/badge/pgvector-PostgreSQL-4169E1?style=flat-square&logo=postgresql&logoColor=white)
 ![OpenRouter](https://img.shields.io/badge/OpenRouter-multi--model-000000?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-115%20passing-1D9E75?style=flat-square)
+[![CI](https://github.com/devviniciusfmk-sys/rag-financial-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/devviniciusfmk-sys/rag-financial-pipeline/actions/workflows/ci.yml)
 ![Docker](https://img.shields.io/badge/Docker-ready-2496ED?style=flat-square&logo=docker&logoColor=white)
 
 ## What it does
